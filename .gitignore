@@ -1,0 +1,18 @@
+# Build output
+.pio/
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Editor / OS junk
+.vscode/
+.idea/
+__pycache__/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local Claude settings
+.claude/settings.local.json

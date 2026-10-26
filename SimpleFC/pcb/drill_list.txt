@@ -1,0 +1,3 @@
+SimpleFC shield drill list
+  1.0 mm : 65 holes
+Board 59.9 x 35.6 mm, single-sided, copper on the bottom.
