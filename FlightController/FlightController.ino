@@ -146,6 +146,8 @@ struct RfGate { bool use; uint32_t goodSince, badSince; };   // altitude rangefi
 #define USE_MTF   1           // 1 = MicoAir MTF-01 optical flow + rangefinder fitted (enables POS HOLD on CH6 POS3)
                               // 0 = no MTF: alt hold uses the VL53L1X (facing down) + barometer
 #define USE_AVOID 0           // 1 = VL53L1X faces forward/back for obstacle avoidance; 0 = it faces DOWN for alt hold
+#define USE_GPS   1           // 1 = GPS (u-blox, UBX) on GPIO21/10 + compass on I2C: GPS position hold, return to home,
+                              //     heading hold. GPIO10 is then the GPS's wire, not the MTF's (the MTF only sends).
 
 #define GYRO_NOTCH_HZ    0.0f      // gyro notch centre in Hz, 0 = off (must be < 250)
 #define GYRO_NOTCH_Q     4.0f
@@ -202,9 +204,9 @@ struct Tune {                      // one set per vehicle
 //      signature must already be declared before that point) ----
 enum UiScreen : uint8_t { SCR_MENU, SCR_TXTEST, SCR_OUTTEST, SCR_ESCCAL };
 enum ItemType : uint8_t { IT_FLOAT, IT_ENUM, IT_SUB, IT_ACTION };
-enum { SUB_MAIN, SUB_RC, SUB_LEVEL, SUB_GYRO, SUB_DIR, SUB_TRIM, SUB_BATT, SUB_FILT, SUB_ALT, SUB_FLOW, SUB_AVOID, SUB_POS, SUB_COUNT };
+enum { SUB_MAIN, SUB_RC, SUB_LEVEL, SUB_GYRO, SUB_DIR, SUB_TRIM, SUB_BATT, SUB_FILT, SUB_ALT, SUB_FLOW, SUB_AVOID, SUB_POS, SUB_GPS, SUB_COUNT };
 enum { ACT_SAVE, ACT_DEFAULTS, ACT_TXTEST, ACT_OUTTEST, ACT_EXIT, ACT_LEVELCAL, ACT_TRIMCLEAR, ACT_ALERTTEST,
-       ACT_ESCCAL, ACT_ESCBOOT, ACT_FLOWCAL };
+       ACT_ESCCAL, ACT_ESCBOOT, ACT_FLOWCAL, ACT_MAGCAL };
 
 struct MenuItem {
   const char *label;
@@ -250,6 +252,18 @@ struct __attribute__((packed)) TelemetryPacket {
 Cfg  cfg;
 uint8_t flightMode = 1;            // 0 = ACRO, 1 = SELF STAB. Set by stick command or menu, stored as "fmode"
 
+// GPS state for the TX, 5 Hz. Its own size, so a TX that does not know it drops it (length check).
+#define GPS_TLM_MAGIC 0xC3F5
+struct __attribute__((packed)) GpsTelemetry {
+  uint16_t magic;
+  uint8_t  bindId;
+  uint8_t  sats;
+  uint8_t  flags;                  // bit0 GPS good, 1 home set, 2 compass OK, 3 RTH, 4 GPS hold, 5 compass found, 6 GPS data
+  uint16_t distHome;               // m
+  int16_t  alt10;                  // altitude estimate, dm
+  uint8_t  crc;
+};
+
 // CH6 is a 3-position switch on the TX: 1000 = DISARM, 1500 = ARM, 2000 = ARM + extra.
 // (The TX turns the switch into the ARM channel CH5 itself; the FC only uses CH6 for the extra.)
 enum { CH6X_OFF = 0, CH6X_AIRMODE = 1, CH6X_BEEPER = 2, CH6X_ALTHOLD = 3, CH6X_POSHOLD = 4 };
@@ -284,6 +298,8 @@ float  rcSmoothHz    = 20.0f;      // RC SMOOTH: stick low-pass between the 50 H
 float  itermRelaxDps = 40.0f;      // ITERM RELAX: I builds up less while the setpoint moves fast (deg/s), 0 = off, "irel"
 float  antiGravGain  = 3.0f;       // ANTI GRAVITY: I builds up faster on quick throttle changes, 0 = off, "antig"
 float  altHover = 1450;            // hover throttle learned while flying SELF STAB (used by the ceiling), "hover"
+float  altThrMid = 1500;           // ALT HOLD: what the TX sends at mid stick (Transmitter2 1500), 0 = hover point only, "thmid"
+float  altRfTau = 0.4f;            // altitude estimate on a rangefinder: blend time, s. Shorter trusts the rangefinder more for vertical speed, "alttau"
 
 // Optical flow + rangefinder module (MicoAir MTF-01/02, MSP v2), adjustable in SETUP > OPT FLOW (stored as "flow")
 enum { RF_AUTO = 0, RF_VL53 = 1, RF_MTF = 2 };
@@ -306,6 +322,41 @@ struct PosCfg {
   float minQuality;                // flow quality (0..255) needed to hold position
 };
 PosCfg posCfg = {1.5f, 8.0f, 3.0f, 2.0f, 20.0f, 60.0f};   // same as defaultPos()
+
+// GPS position hold, return to home and heading hold, adjustable in SETUP > GPS/COMPASS (stored as "gps")
+struct GpsCfg {
+  float   posP;                    // m/s of correction per m of position error
+  float   velP;                    // deg of tilt per m/s of speed error
+  float   velI;                    // deg of tilt per (m/s * s): wind
+  float   maxSpeed;                // m/s with full roll/pitch stick in GPS hold
+  float   maxTilt;                 // deg: strongest tilt GPS hold / RTH may use
+  float   minSats;                 // satellites needed to trust the GPS
+  float   rthAltM;                 // RTH climbs to this height (m above the arming point) before flying home
+  float   rthSpeed;                // m/s flying home
+  float   hdgP;                    // heading hold: deg/s of yaw per deg of heading error
+  uint8_t fsRth;                   // 1 = radio lost -> return home (GPS good), else land where it is
+  uint8_t hdgHold;                 // 1 = hold the nose direction while the yaw stick is centred (SELF/ALT/POS)
+};
+GpsCfg gpsCfg = {0.8f, 5.0f, 1.0f, 3.0f, 20.0f, 7.0f, 10.0f, 3.0f, 2.0f, 1, 1};   // same as defaultGps()
+
+// Compass calibration + mounting, SETUP > GPS/COMPASS (stored as "mag")
+struct MagCfg {
+  float   off[3];                  // hard-iron offsets, chip axes (raw counts)
+  float   scl[3];                  // 1 / radius per chip axis: calibrated field length ~1
+  float   decl;                    // magnetic declination, deg (east +)
+  uint8_t align;                   // 0/1/2/3 = the compass X arrow points forward / right / back / left (top view)
+  uint8_t flip;                    // 1 = compass chip upside down (component side facing the ground)
+  uint8_t cal;                     // 1 = COMPASS CAL done
+};
+MagCfg magCfg = {{0, 0, 0}, {1, 1, 1}, 0, 0, 0, 0};
+
+// return to home phases (GPS section)
+enum { RTH_OFF = 0, RTH_CLIMB, RTH_RETURN, RTH_LAND };
+uint8_t rthPhase = RTH_OFF;
+bool    rthFs = false;             // started by the radio failsafe (else by the TX button)
+float   navClimb = 0;              // m/s climb command from RTH (replaces the throttle stick in alt hold)
+enum { PSRC_FLOW = 0, PSRC_GPS = 1 };
+uint8_t posSrc = PSRC_FLOW;        // what POS HOLD navigates with right now
 
 // Obstacle avoidance with a FORWARD-facing VL53L1X, adjustable in SETUP > AVOIDANCE (stored as "avoid")
 enum { VL53_DOWN = 0, VL53_FORWARD = 1, VL53_BACKWARD = 2 };   // BACKWARD = faces the FC board's rear
@@ -385,6 +436,41 @@ void sanitizePos(PosCfg &p) {
   if (!(p.maxSpeed >= 0.2f && p.maxSpeed <= 3)) p.maxSpeed = d.maxSpeed;
   if (!(p.maxTilt >= 3 && p.maxTilt <= 30))   p.maxTilt = d.maxTilt;
   if (!(p.minQuality >= 0 && p.minQuality <= 250)) p.minQuality = d.minQuality;
+}
+
+void defaultGps(GpsCfg &g) {
+  g.posP = 0.8f;  g.velP = 5.0f;  g.velI = 1.0f;
+  g.maxSpeed = 3.0f;  g.maxTilt = 20.0f;  g.minSats = 7;
+  g.rthAltM = 10;  g.rthSpeed = 3.0f;  g.hdgP = 2.0f;
+  g.fsRth = 1;  g.hdgHold = 1;
+}
+
+void sanitizeGps(GpsCfg &g) {
+  GpsCfg d; defaultGps(d);
+  if (!(g.posP >= 0 && g.posP <= 3))          g.posP = d.posP;
+  if (!(g.velP >= 0 && g.velP <= 20))         g.velP = d.velP;
+  if (!(g.velI >= 0 && g.velI <= 10))         g.velI = d.velI;
+  if (!(g.maxSpeed >= 0.5f && g.maxSpeed <= 6)) g.maxSpeed = d.maxSpeed;
+  if (!(g.maxTilt >= 5 && g.maxTilt <= 30))   g.maxTilt = d.maxTilt;
+  if (!(g.minSats >= 4 && g.minSats <= 15))   g.minSats = d.minSats;
+  if (!(g.rthAltM >= 3 && g.rthAltM <= 50))   g.rthAltM = d.rthAltM;
+  if (!(g.rthSpeed >= 0.5f && g.rthSpeed <= 6)) g.rthSpeed = d.rthSpeed;
+  if (!(g.hdgP >= 0 && g.hdgP <= 10))         g.hdgP = d.hdgP;
+  g.fsRth = g.fsRth ? 1 : 0;
+  g.hdgHold = g.hdgHold ? 1 : 0;
+}
+
+void sanitizeMag(MagCfg &m) {
+  bool ok = true;
+  for (int i = 0; i < 3; i++) {
+    if (!(fabsf(m.off[i]) < 30000)) ok = false;
+    if (!(m.scl[i] > 0 && m.scl[i] < 10)) ok = false;
+  }
+  if (!ok) { for (int i = 0; i < 3; i++) { m.off[i] = 0; m.scl[i] = 1; } m.cal = 0; }
+  if (!(m.decl >= -30 && m.decl <= 30)) m.decl = 0;
+  if (m.align > 3) m.align = 0;
+  m.flip = m.flip ? 1 : 0;
+  m.cal = m.cal ? 1 : 0;
 }
 
 void defaultAvoid(AvoidCfg &a) {
@@ -568,6 +654,13 @@ void loadParams() {
     sanitizePos(posCfg);
     if (posCfg.maxSpeed == 1.0f && posCfg.maxTilt == 15.0f) { posCfg.maxSpeed = 2.0f; posCfg.maxTilt = 20.0f; }   // old defaults -> new
     if (posCfg.posP == 1.0f && posCfg.velP == 6.0f && posCfg.velI == 2.0f) { posCfg.posP = 1.5f; posCfg.velP = 8.0f; posCfg.velI = 3.0f; }   // stronger hold
+    defaultGps(gpsCfg);
+    if (prefs.getBytesLength("gps") == sizeof(GpsCfg)) prefs.getBytes("gps", &gpsCfg, sizeof(GpsCfg));
+    sanitizeGps(gpsCfg);
+    if (prefs.getBytesLength("mag") == sizeof(MagCfg)) prefs.getBytes("mag", &magCfg, sizeof(MagCfg));
+    sanitizeMag(magCfg);
+    altThrMid = prefs.getFloat("thmid", 1500.0f);  if (!(altThrMid >= 0 && altThrMid <= 1800)) altThrMid = 1500.0f;
+    altRfTau = prefs.getFloat("alttau", 0.4f);  if (!(altRfTau >= 0.2f && altRfTau <= 1.5f)) altRfTau = 0.4f;
     altHover = prefs.getFloat("hover", 1450.0f);
     Serial.printf("Hover throttle (ALT HOLD hold point): %.0f us\n", altHover);
     if (!(altHover >= 1100 && altHover <= 1800)) altHover = 1450.0f;
@@ -626,11 +719,15 @@ bool saveParams() {
     prefs.putFloat("rcsm", rcSmoothHz);
     prefs.putFloat("irel", itermRelaxDps);
     prefs.putFloat("antig", antiGravGain);
+    prefs.putFloat("thmid", altThrMid);
+    prefs.putFloat("alttau", altRfTau);
     prefs.putBytes("filt", &filt, sizeof(FiltCfg));
     prefs.putBytes("alth", &altCfg, sizeof(AltCfg));
     prefs.putBytes("flow", &flowCfg, sizeof(FlowCfg));
     prefs.putBytes("avoid", &avoidCfg, sizeof(AvoidCfg));
     prefs.putBytes("posh", &posCfg, sizeof(PosCfg));
+    prefs.putBytes("gps", &gpsCfg, sizeof(GpsCfg));
+    prefs.putBytes("mag", &magCfg, sizeof(MagCfg));
     prefs.end();
   }
   if (ok) dirty = false;
@@ -827,7 +924,10 @@ uint16_t rcGapCount = 0;                    // link gaps longer than RC_STALE_MS
 uint32_t rcGapMaxMs = 0;                    // longest gap this flight
 bool     fsLanding = false;                  // radio lost in ALT/POS HOLD: descending by itself
 uint32_t fsLandStart = 0;
+uint32_t fsLandMaxMs = FS_LAND_MAX_MS;       // failsafe landing: disarm after this long (longer when high up)
+#define  FS_DESC_MPS 0.5f                     // slowest descent assumed for that time (m/s)
 extern bool altHoldActive, altValid, altLanded;   // defined in the ALT HOLD section
+extern float altEst;
 void altHoldEngage();
 
 // Two-stage radio failsafe:
@@ -851,17 +951,30 @@ void readRC() {
   // auto-land is possible in ALT/POS HOLD, and in SELF STAB when flying with a working altitude sensor (the FC
   // then switches alt hold on by itself). ACRO (no self-level) still disarms.
   bool canLand = altValid && !altLanded && (altHoldActive || (inFlight && mode == MODE_SELF && cfg.vehicle == VEH_QUAD));
-  if (!rcValid && armed && (fsLanding || canLand)) {
+  // GPS: radio lost far enough from home -> return home first (rthTick flies it; it lands there, then disarms)
+  if (!rcValid && armed && !fsLanding) {
+    if (rthPhase && !rthFs) rthFs = true;   // button RTH running: carry on without the radio
+    if (rthPhase) rcValid = true;
+    else if (gpsCfg.fsRth && canLand && rthPossible(millis()) && homeDist() > 5.0f) {
+      Serial.println("FAILSAFE: radio lost - return to home");
+      rthBegin(true);
+      rcValid = true;
+    }
+  }
+  if (rthPhase && rthFs) {
+    if (rcFresh) rthEnd("RADIO BACK");      // the pilot has control again
+  } else if (!rcValid && armed && (fsLanding || canLand)) {
     uint32_t now = millis();
     if (!fsLanding) {
       fsLanding = true; fsLandStart = now;
+      fsLandMaxMs = max((uint32_t)FS_LAND_MAX_MS, (uint32_t)(max(altEst, 0.0f) * 1500.0f / FS_DESC_MPS) + 5000);   // high up: more time
       if (!altHoldActive) altHoldEngage();  // from SELF STAB: hold/descend on the altitude sensor
       Serial.println("FAILSAFE: radio lost - auto landing");
     }
     ch[0] = 1500; ch[1] = 1500; ch[3] = 1500;
     ch[2] = 1000;                           // alt hold: stick fully down = descend at MAX DESCENT
     // keep flying (arm + CH6 keep their last value) until landed, the altitude is lost, or the time is up
-    if (!altLanded && altValid && now - fsLandStart < FS_LAND_MAX_MS) rcValid = true;
+    if (!altLanded && altValid && now - fsLandStart < fsLandMaxMs) rcValid = true;
   } else if (rcFresh) {
     if (fsLanding) Serial.println("FAILSAFE: radio back - control returned");
     fsLanding = false;
@@ -893,7 +1006,7 @@ float stickToRate(float x, float center, float maxRate, float expo) {
 bool armed = false;
 bool armSwitchSeenLow = false;
 
-enum { PAGE_STATUS = 0, PAGE_RC, PAGE_CURVE, PAGE_STATS, PAGE_TREND, PAGE_SENSORS, PAGE_ALT, PAGE_FLOW, PAGE_SETUP, PAGE_COUNT };
+enum { PAGE_STATUS = 0, PAGE_RC, PAGE_CURVE, PAGE_STATS, PAGE_TREND, PAGE_SENSORS, PAGE_ALT, PAGE_FLOW, PAGE_GPS, PAGE_SETUP, PAGE_COUNT };
 uint8_t page = PAGE_STATUS;
 
 char msgText[24] = "";
@@ -1776,6 +1889,7 @@ const char *const NM_ALIGN[] = {"0", "90 CW", "180", "270 CW"};
 const char *const NM_COMP[]  = {"SUBTRACT", "ADD", "OFF"};
 const char *const NM_RFSRC[] = {"AUTO", "VL53L1X", "MTF"};
 const char *const NM_ROLE[]  = {"DOWN (ALT)", "FORWARD", "BACKWARD"};
+const char *const NM_MAGDIR[] = {"FORWARD", "RIGHT", "BACK", "LEFT"};
 
 const MenuItem menuMain[] = {
   E_ITEM("VEHICLE", cfg.vehicle, NM_VEH, 2),
@@ -1793,6 +1907,9 @@ const MenuItem menuMain[] = {
   S_ITEM("AVOIDANCE", SUB_AVOID),
 #endif
   S_ITEM("POS HOLD", SUB_POS),
+#if USE_GPS
+  S_ITEM("GPS/COMPASS", SUB_GPS),
+#endif
   A_ITEM("TX CHECK", ACT_TXTEST),
   A_ITEM("OUTPUT TEST", ACT_OUTTEST),
   A_ITEM("ESC CALIBRATE", ACT_ESCCAL),
@@ -1893,9 +2010,11 @@ const MenuItem menuAlt[] = {
   F_ITEM("MAX CLIMB",    altCfg.maxClimb, 0.2f, 5, 0.1f, 1),
   F_ITEM("MAX DESCENT",  altCfg.maxDesc,  0.2f, 3, 0.1f, 1),
   F_ITEM("STICK DBAND",  altCfg.deadband, 20, 250, 10, 0),
+  F_ITEM("STICK MID 0=HVR", altThrMid,    0, 1800, 10, 0),
   F_ITEM("MIN THROTTLE", altCfg.minThr,   1050, 1500, 10, 0),
   F_ITEM("CEILING 0=OFF", altCfg.ceilingM, 0, 400, 1, 0),
   F_ITEM("TOF MAX M",    altCfg.tofMaxM,  0.3f, 8.0f, 0.1f, 1),
+  F_ITEM("EST BLEND S",  altRfTau,        0.2f, 1.5f, 0.1f, 1),
 };
 
 // MicoAir MTF-01/02 optical flow. Check on the FLOW page (BOOT button) - the title here shows flow quality.
@@ -1919,6 +2038,25 @@ const MenuItem menuPos[] = {
   F_ITEM("MIN QUALITY", posCfg.minQuality, 0, 250, 5, 0),
 };
 
+// GPS + compass (GPS page on the BOOT button shows the live state). Title shows satellites + heading.
+const MenuItem menuGps[] = {
+  A_ITEM("COMPASS CAL",   ACT_MAGCAL),
+  E_ITEM("MAG ARROW",     magCfg.align,     NM_MAGDIR, 4),
+  E_ITEM("MAG UPSIDE DN", magCfg.flip,      NM_NOYES, 2),
+  F_ITEM("DECLINATION",   magCfg.decl,      -30, 30, 0.5f, 1),
+  E_ITEM("HEADING HOLD",  gpsCfg.hdgHold,   NM_OFFON, 2),
+  F_ITEM("HEADING P",     gpsCfg.hdgP,      0, 10, 0.5f, 1),
+  F_ITEM("GPS POS P",     gpsCfg.posP,      0, 3, 0.1f, 1),
+  F_ITEM("GPS VEL P",     gpsCfg.velP,      0, 20, 0.5f, 1),
+  F_ITEM("GPS VEL I",     gpsCfg.velI,      0, 10, 0.5f, 1),
+  F_ITEM("GPS MAX SPEED", gpsCfg.maxSpeed,  0.5f, 6, 0.5f, 1),
+  F_ITEM("GPS MAX TILT",  gpsCfg.maxTilt,   5, 30, 1, 0),
+  F_ITEM("MIN SATS",      gpsCfg.minSats,   4, 15, 1, 0),
+  F_ITEM("RTH ALT M",     gpsCfg.rthAltM,   3, 50, 1, 0),
+  F_ITEM("RTH SPEED",     gpsCfg.rthSpeed,  0.5f, 6, 0.5f, 1),
+  E_ITEM("FAILSAFE RTH",  gpsCfg.fsRth,     NM_OFFON, 2),
+};
+
 const MenuItem menuAvoid[] = {
   E_ITEM("VL53 POINTS",  avoidCfg.role,      NM_ROLE, 3),
   E_ITEM("AVOIDANCE",    avoidCfg.enabled,   NM_OFFON, 2),
@@ -1940,6 +2078,7 @@ const Menu menus[SUB_COUNT] = {
   {"OPT FLOW",   menuFlow,  COUNT_OF(menuFlow)},
   {"AVOIDANCE",  menuAvoid, COUNT_OF(menuAvoid)},
   {"POS HOLD",   menuPos,   COUNT_OF(menuPos)},
+  {"GPS/COMPASS", menuGps,  COUNT_OF(menuGps)},
 };
 
 // ---- menu state ----
@@ -1995,6 +2134,9 @@ void onPageChange() {                      // called when the BOOT button change
 
 void afterEdit() {
   dirty = true;
+#if USE_GPS
+  if (curMenu == SUB_GPS) magResetCheck();   // compass mounting changed: check its turning direction again
+#endif
   sanitizeTune();
   applyParams();
 }
@@ -2034,8 +2176,10 @@ void doAction(uint8_t a) {
         defaultTune(T, v);
         defaultFilt(filt);
         defaultAlt(altCfg);
+        altRfTau = 0.4f;
         { uint8_t role = avoidCfg.role; defaultAvoid(avoidCfg); avoidCfg.role = role; }   // keep how it is mounted
         defaultPos(posCfg);
+        defaultGps(gpsCfg);                  // the compass calibration belongs to the hardware: kept
         confirmDefaultsUntil = 0;
         afterEdit();
         setMsg("DEFAULTS LOADED");
@@ -2055,6 +2199,9 @@ void doAction(uint8_t a) {
       break;
     case ACT_FLOWCAL:                      // optical flow: rock the craft for 10 s
       flowCalStart();
+      break;
+    case ACT_MAGCAL:                       // compass: turn the craft through every direction for 45 s
+      magCalStart();
       break;
     case ACT_ESCCAL:                       // step-by-step, FC on USB, battery plugged in during the procedure
       screen = SCR_ESCCAL;
@@ -2255,7 +2402,8 @@ bool     altHoldActive = false;
 bool     altLanded = false;                  // alt hold on the ground: motors idle until the stick goes above centre
 uint32_t altLandSince = 0;
 float    altTarget = 0, altVelTarget = 0, altInteg = 0;
-float    altRefThr = 1500;                   // stick position meaning "hold" (where it was when engaged)
+float    altRefThr = 1500;                   // middle of the hold zone
+float    altZoneLo = 1420, altZoneHi = 1580; // throttle stick inside this zone = hold height (set when engaged)
 float    altHoverBase = 1500;                // throttle (stick us) at engagement
 float    altThrOut = 1500;                   // last throttle alt hold commanded
 uint32_t exitBlendStart = 0;                 // smooth hand-back to the stick after alt hold ends
@@ -2282,25 +2430,35 @@ bool rfGate(RfGate &g, bool fresh, float hM, float maxM, uint32_t ms) {
 }
 
 // 1 = barometer, 2 = VL53L1X, 3 = MTF rangefinder, 0 = nothing
-// VL53L1X plausibility: when both rangefinders read but disagree by > 0.3 m for over a second, the VL53L1X is
-// not trusted again until the next disarm (seen in flight: VL53L1X 0.10-0.30 m while the MTF read 0.5-1.1 m -
-// something in its field of view or a dirty window). It is then never used as backup or for the cross-check.
-bool vl53Distrust = false;
+// Rangefinder plausibility: when both read but disagree by > 0.3 m for 0.5 s, the SHORTER one is not used until they
+// agree again for 1 s (or the next disarm). Something in front of a sensor can only make it read too short. Seen in
+// flight: VL53L1X 0.10-0.30 m while the MTF read 0.5-1.1 m, and MTF 0.15 m (then 0.01 m) while the VL53L1X read 1.5 m:
+// always believing the MTF kept that quad climbing with the FC thinking it was at 0.2 m, and it crashed. The altitude
+// source then changes (the frame shifts with it, so the hold target does not jump), and the buzzer warns: land.
+bool vl53Distrust = false, mtfDistrust = false;
 
 uint8_t altPickSource(uint32_t ms) {
-  static uint32_t disagreeSince = 0;
-  if (!armed) { vl53Distrust = false; disagreeSince = 0; }
-  else if (!vl53Distrust && mspRfFresh(ms) && tofValid && ms - tofLastGood < 250) {
-    bool off = fabsf(mspRfHeightCm - tofHeightCm) > 30.0f;
-    if (off) { if (!disagreeSince) disagreeSince = ms ? ms : 1; } else disagreeSince = 0;
-    if (disagreeSince && ms - disagreeSince > 1000) {
-      vl53Distrust = true;
-      Serial.printf("VL53L1X disagrees with MTF (%.0f vs %.0f cm): not used this flight\n", tofHeightCm, mspRfHeightCm);
+  static uint32_t disagreeSince = 0, agreeSince = 0, lastBeep = 0;
+  if (!armed) { vl53Distrust = mtfDistrust = false; disagreeSince = agreeSince = 0; }
+  else if (mspRfFresh(ms) && tofValid && ms - tofLastGood < 250) {
+    float diff = mspRfHeightCm - tofHeightCm;
+    if (fabsf(diff) > 30.0f) { if (!disagreeSince) disagreeSince = ms ? ms : 1; } else disagreeSince = 0;
+    if (fabsf(diff) < 15.0f) { if (!agreeSince) agreeSince = ms ? ms : 1; } else agreeSince = 0;
+    if (disagreeSince && ms - disagreeSince > 500 && mtfDistrust != (diff < 0)) {
+      mtfDistrust = diff < 0;
+      vl53Distrust = !mtfDistrust;
+      setMsg(mtfDistrust ? "MTF BLOCKED? LAND" : "VL53 BLOCKED? LAND");
+      Serial.printf("%s reads short (MTF %.0f, VL53L1X %.0f cm): not used for now\n", mtfDistrust ? "MTF" : "VL53L1X", mspRfHeightCm, tofHeightCm);
+    }
+    if (agreeSince && ms - agreeSince > 1000 && (mtfDistrust || vl53Distrust)) {
+      mtfDistrust = vl53Distrust = false;
+      Serial.println("Rangefinders agree again");
     }
   }
+  if ((mtfDistrust || vl53Distrust) && ms - lastBeep > 2000) { lastBeep = ms; alertEvent(0x15, 5); }   // three beeps, every 2 s
   bool vl53Down = avoidCfg.role == VL53_DOWN && tofOK && !vl53Distrust;
-  bool allowV = vl53Down && flowCfg.rfSource != RF_MTF;
-  bool allowM = flowCfg.rfSource != RF_VL53 || !vl53Down;
+  bool allowV = vl53Down && (flowCfg.rfSource != RF_MTF || mtfDistrust);
+  bool allowM = !mtfDistrust && (flowCfg.rfSource != RF_VL53 || !vl53Down);
   float maxV = altCfg.tofMaxM;
   // both gates are updated every tick (no short-circuit) so their hysteresis timers stay current
   bool v = rfGate(gateVl53, allowV && tofValid && (ms - tofLastGood) < 250, tofHeightCm * 0.01f, maxV, ms);
@@ -2354,7 +2512,7 @@ void altEstTick(float dt, uint32_t ms) {
     return;
   }
 
-  float tau = (src >= 2) ? 0.8f : 2.5f;      // trust the rangefinder more than the barometer
+  float tau = (src >= 2) ? altRfTau : 2.5f;  // trust the rangefinder more than the barometer
   float k1 = 3.0f / tau, k2 = 3.0f / (tau * tau), k3 = 1.0f / (tau * tau * tau);
   float err = meas - altEst;
   accCorr = constrain(accCorr + err * k3 * dt, -3.0f, 3.0f);
@@ -2385,7 +2543,7 @@ void altLearnHover(float dt) {
       fabsf(roll) < 10 && fabsf(pitch) < 10 && ch[2] > 1150)
     altHover += (thrToRef(ch[2]) - altHover) * dt / 4.0f;          // stored as reference throttle
   // in ALT / POS HOLD: learn from the throttle the hold really needs (stick in the hold zone, steady, level)
-  if (armed && altHoldActive && !altLanded && fabsf(ch[2] - altRefThr) <= altCfg.deadband &&
+  if (armed && altHoldActive && !altLanded && ch[2] >= altZoneLo && ch[2] <= altZoneHi &&
       fabsf(velEst) < 0.15f && fabsf(roll) < 8 && fabsf(pitch) < 8 && altThrOut > 1150)
     altHover += (altThrRef - altHover) * dt / 8.0f;
   if (wasArmed && !armed) {                  // after a flight: remember it for next time
@@ -2416,9 +2574,10 @@ float tiltComp(float thr) {                  // more throttle when tilted, so th
 }
 
 // throttle (stick us scale) while alt hold is active
-// The HOVER POINT (hover throttle learned in SELF STAB and in alt hold, "hover") is the stick position that
-// means HOLD: stick within STICK DBAND of it = hold height, above = climb, below = descend. So the stick that
-// hovers in SELF STAB also holds in ALT HOLD - switching modes needs no stick change.
+// HOLD ZONE: from the lower to the higher of MID STICK (STICK MID) and the HOVER POINT (hover throttle learned in
+// SELF STAB and in alt hold, "hover"), plus STICK DBAND on both sides. Inside = hold height, above = climb, below =
+// descend. So mid stick always holds, and the stick that hovers in SELF STAB also holds: switching into a hold mode
+// needs no stick change.
 // Ground start (armed in POS2/POS3): "landed" = motors at idle until the stick goes above the hover point, then
 // it takes off and climbs. Landing: stick fully down -> it descends; once it sits still on the ground for 0.8 s
 // it is "landed" again (motors idle) - ready to disarm, or to take off again with the stick above the hover point.
@@ -2427,7 +2586,7 @@ float hoverPoint() { return constrain(thrFromRef(altHover), 1200.0f, 1750.0f); }
 float altHoldThrottle(float dt) {
   uint32_t ms = millis();
   if (altLanded) {
-    if (ch[2] > altRefThr + altCfg.deadband) {             // takeoff
+    if (ch[2] > altZoneHi) {                               // takeoff
       altLanded = false;
       altTarget = altEst;
       altInteg = 0;
@@ -2463,10 +2622,10 @@ float altHoldThrottle(float dt) {
     }
   }
 
-  float d = ch[2] - altRefThr, db = altCfg.deadband;
   float climb = 0;
-  if (d > db)       climb =  constrain((d - db) / 300.0f, 0.0f, 1.0f) * altCfg.maxClimb;
-  else if (d < -db) climb = -constrain((-d - db) / 300.0f, 0.0f, 1.0f) * altCfg.maxDesc;
+  if (ch[2] > altZoneHi)      climb =  constrain((ch[2] - altZoneHi) / 300.0f, 0.0f, 1.0f) * altCfg.maxClimb;
+  else if (ch[2] < altZoneLo) climb = -constrain((altZoneLo - ch[2]) / 300.0f, 0.0f, 1.0f) * altCfg.maxDesc;
+  if (rthPhase && rthPhase != RTH_LAND) climb = navClimb;  // RTH climbs / holds by itself
 
   // The stick moves the TARGET height at the commanded rate; the controller always holds that target. (It used to
   // drop the target and only follow the climb rate - with the stick just outside the hold zone, alt hold then
@@ -2496,19 +2655,26 @@ float ceilingLimitThrottle(float thr) {
   return min(thr, lim);
 }
 
-// armed on the ground with CH6 in POS2/POS3: wait at idle, stick above CENTRE = take off
+void altSetZone() {
+  float h = hoverPoint(), m = altThrMid >= 1100 ? altThrMid : h;
+  altZoneLo = min(h, m) - altCfg.deadband;
+  altZoneHi = max(h, m) + altCfg.deadband;
+  altRefThr = (altZoneLo + altZoneHi) * 0.5f;
+}
+
+// armed on the ground with CH6 in POS2/POS3: wait at idle, stick above the hold zone = take off
 void altHoldEngageGround() {
   altHoldActive = true;
   altLanded = true;
   altLandSince = 0;
   altTarget = altEst;
-  altRefThr = hoverPoint();                  // stick at the hover point = hold
+  altSetZone();
   altHoverBase = constrain(altHover, 1150.0f, 1750.0f);   // feed-forward (reference throttle)
   altInteg = 0;
   altThrOut = 1000;
   setMsg("ALT: STICK UP=TAKEOFF");
   alertEvent(0x3, 3);
-  Serial.printf("ALT HOLD ground start: hover point %.0f us, stick above it to take off\n", altRefThr);
+  Serial.printf("ALT HOLD ground start: hold zone %.0f..%.0f us, stick above it to take off\n", altZoneLo, altZoneHi);
 }
 
 void altHoldEngage() {
@@ -2516,13 +2682,13 @@ void altHoldEngage() {
   altLanded = false;
   altLandSince = 0;
   altTarget = altEst;
-  altRefThr = hoverPoint();                  // hold zone = around the hover throttle, not where the stick is now
+  altSetZone();                              // not where the stick is now
   altHoverBase = constrain(altHover, 1150.0f, 1750.0f);   // feed-forward (reference throttle)
   altInteg = 0;
   altThrOut = ch[2];
   setMsg("ALT HOLD ON");
   alertEvent(0x3, 3);                        // one long beep
-  Serial.printf("ALT HOLD ON at %.2f m, hover point %.0f (%s)\n", altEst, altRefThr, altSrcName());
+  Serial.printf("ALT HOLD ON at %.2f m, hold zone %.0f..%.0f (%s)\n", altEst, altZoneLo, altZoneHi, altSrcName());
 }
 
 void altHoldDisengage(const char *why) {
@@ -2652,6 +2818,412 @@ void updateArming() {
   setMsg("ARMED");
   alertEvent(0x3, 2);
   Serial.println("ARMED");
+#if USE_GPS
+  navOnArm();                               // home point = here, if the GPS is good
+#endif
+}
+
+// ======================= GPS (u-blox, UBX) + COMPASS (QMC5883L / HMC5883L) + RETURN TO HOME =======================
+// Wiring (BN-880 / BN-220 + separate compass):
+//   GPS TX -> 1k resistor -> GPIO21 (FC RX). The resistor: the C3's boot ROM drives GPIO21 (UART0 TX) for a moment
+//            at power-up; with it the two outputs can not fight.
+//   GPS RX <- GPIO10 (FC TX). Take the MTF's RX wire off GPIO10 (the MTF only sends, it never needed it).
+//   Compass SDA/SCL -> GPIO6/7 with the other I2C sensors. 5V + GND.
+// The FC sets the GPS up at every boot, whatever baud it was on: 115200, UBX NAV-PVT only, 10 Hz, airborne model.
+// Frames: GPS position in metres north/east of the ORIGIN = the home point (set when arming with a good fix).
+// Heading: gyro-integrated, pulled to the tilt-compensated compass heading (time constant ~2 s) while the compass
+// is healthy (calibrated, field strength normal, turning the right way).
+#define GPS_RX_PIN 21
+#define GPS_TX_PIN 10
+#define GPS_BAUD   115200
+#define MAG_PERIOD_MS 20               // compass read rate (50 Hz)
+#define MAG_CAL_MS    45000            // COMPASS CAL: turn it through every direction for this long
+
+extern bool posActive;                 // POSITION HOLD section
+bool     gpsFound = false;             // NAV-PVT frames have arrived
+uint8_t  gpsFix = 0, gpsSats = 0;      // fix type (3 = 3D), satellites used
+bool     gpsFixOk = false;             // receiver's own "fix OK" flag
+int32_t  gpsLat = 0, gpsLon = 0;       // deg * 1e7
+float    gpsHAcc = 99, gpsVelN = 0, gpsVelE = 0;   // m, m/s
+uint32_t gpsLastMs = 0, gpsNmeaMs = 0, gpsCfgMs = 0;
+uint16_t gpsMsgs = 0, gpsHz = 0;
+bool     gpsOriginSet = false, homeSet = false;
+int32_t  gpsLat0 = 0, gpsLon0 = 0;
+float    gpsLonScale = 1;              // cos(latitude of the origin)
+float    gpsN = 0, gpsE = 0;           // m from the origin (home once armed)
+float    gpsVelF = 0, gpsVelR = 0;     // m/s, body axes, smoothed
+
+uint8_t  magAddr = 0;                  // 0x0D QMC5883L, 0x1E HMC5883L, 0 = none
+bool     magOK = false;
+float    magRaw[3] = {0, 0, 0};        // chip axes, raw counts
+float    magLen = 0;                   // calibrated field length (~1 when healthy)
+float    magHdgDeg = 0;                // tilt-compensated compass heading, deg clockwise from true north
+uint32_t magLastMs = 0;
+bool     magNew = false;
+bool     magDirBad = false;            // the compass turns the opposite way to the gyro: wrong UPSIDE DN setting
+uint8_t  magDirGood = 0, magDirWrong = 0;
+float    hdgDeg = 0;                   // fused heading, deg clockwise (true north once the compass has been seen)
+bool     hdgInit = false;
+bool     magCalActive = false;
+uint32_t magCalT0 = 0;
+float    mcMin[3], mcMax[3];
+
+float wrap180(float a) { while (a > 180) a -= 360; while (a < -180) a += 360; return a; }
+float wrap360(float a) { while (a >= 360) a -= 360; while (a < 0) a += 360; return a; }
+int32_t rd32le(const uint8_t *p) {
+  return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+void magResetCheck() { magDirBad = false; magDirGood = magDirWrong = 0; hdgInit = false; }
+bool magHealthy(uint32_t ms) {         // compass heading can be trusted right now
+  return magOK && magCfg.cal && !magDirBad && magLastMs && ms - magLastMs < 500 && magLen > 0.6f && magLen < 1.4f;
+}
+bool gpsGood(uint32_t ms) {
+  return gpsLastMs && ms - gpsLastMs < 500 && gpsFix >= 3 && gpsFixOk && gpsSats >= (uint8_t)gpsCfg.minSats && gpsHAcc < 3.0f;
+}
+bool navReady(uint32_t ms) { return gpsGood(ms) && gpsOriginSet && hdgInit && magHealthy(ms); }   // GPS hold / RTH possible
+float homeDist() { return homeSet ? sqrtf(gpsN * gpsN + gpsE * gpsE) : 0; }
+
+// ---- GPS ----
+void ubxSend(uint8_t cls, uint8_t id, const uint8_t *p, uint16_t n) {
+  uint8_t h[6] = {0xB5, 0x62, cls, id, (uint8_t)n, (uint8_t)(n >> 8)};
+  uint8_t a = 0, b = 0;
+  for (int i = 2; i < 6; i++) { a += h[i]; b += a; }
+  for (int i = 0; i < n; i++) { a += p[i]; b += a; }
+  Serial0.write(h, 6);
+  if (n) Serial0.write(p, n);
+  Serial0.write(a);
+  Serial0.write(b);
+}
+
+// Tell the GPS (at whatever baud it runs) to switch to 115200 + UBX, then set NAV-PVT at 10 Hz. ~60 ms, disarmed only.
+void gpsConfigure() {
+  static const uint32_t bauds[4] = {9600, 38400, 57600, 115200};
+  const uint8_t prt[20] = {1, 0, 0, 0, 0xD0, 0x08, 0, 0, 0x00, 0xC2, 0x01, 0x00,   // UART1, 8N1, 115200
+                           0x03, 0x00, 0x01, 0x00, 0, 0, 0, 0};                    // in UBX+NMEA, out UBX
+  for (int i = 0; i < 4; i++) { Serial0.updateBaudRate(bauds[i]); ubxSend(0x06, 0x00, prt, 20); Serial0.flush(); delay(5); }
+  Serial0.updateBaudRate(GPS_BAUD);
+  delay(20);
+  const uint8_t rate[6] = {100, 0, 1, 0, 1, 0};          // 100 ms = 10 Hz
+  ubxSend(0x06, 0x08, rate, 6);
+  const uint8_t msg[3] = {0x01, 0x07, 1};                // NAV-PVT every solution
+  ubxSend(0x06, 0x01, msg, 3);
+  uint8_t nav5[36] = {0};
+  nav5[0] = 0x01; nav5[2] = 6;                           // dynamic model: airborne < 1 g
+  ubxSend(0x06, 0x24, nav5, 36);
+  Serial0.flush();
+  gpsCfgMs = millis();
+}
+
+void gpsSetOrigin() {
+  gpsLat0 = gpsLat; gpsLon0 = gpsLon;
+  gpsLonScale = cosf(gpsLat * 1e-7f * DEG_TO_RAD);
+  gpsOriginSet = true;
+  gpsN = gpsE = 0;
+}
+
+void gpsOnPvt(const uint8_t *p, uint32_t ms) {
+  gpsFound = true;
+  gpsMsgs++;
+  gpsLastMs = ms;
+  gpsFix = p[20];
+  gpsFixOk = p[21] & 1;
+  gpsSats = p[23];
+  gpsLon = rd32le(p + 24);
+  gpsLat = rd32le(p + 28);
+  gpsHAcc = (uint32_t)rd32le(p + 40) * 0.001f;
+  gpsVelN = rd32le(p + 48) * 0.001f;
+  gpsVelE = rd32le(p + 52) * 0.001f;
+  if (gpsGood(ms)) {
+    if (!gpsOriginSet) gpsSetOrigin();
+    gpsN = (gpsLat - gpsLat0) * 0.0111319491f;           // 1e-7 deg of latitude = 1.11 cm
+    gpsE = (gpsLon - gpsLon0) * 0.0111319491f * gpsLonScale;
+  }
+}
+
+void gpsPoll(uint32_t ms) {
+  static uint8_t st = 0, cls = 0, id = 0, ca = 0, cb = 0, buf[100];
+  static uint16_t len = 0, idx = 0;
+  uint8_t inb[64];
+  int n = Serial0.available();
+  if (n > 0) {
+    if (n > (int)sizeof(inb)) n = sizeof(inb);           // bounded work per loop tick
+    n = Serial0.read(inb, n);
+    for (int i = 0; i < n; i++) {
+      uint8_t c = inb[i];
+      switch (st) {
+        case 0: if (c == 0xB5) st = 1; else if (c == '$') gpsNmeaMs = ms ? ms : 1; break;   // '$' = NMEA: not set up
+        case 1: st = (c == 0x62) ? 2 : 0; break;
+        case 2: cls = c; ca = c; cb = c; st = 3; break;
+        case 3: id = c; ca += c; cb += ca; st = 4; break;
+        case 4: len = c; ca += c; cb += ca; st = 5; break;
+        case 5:
+          len |= (uint16_t)c << 8; ca += c; cb += ca; idx = 0;
+          st = (len > sizeof(buf)) ? 0 : (len ? 6 : 7);
+          break;
+        case 6: buf[idx++] = c; ca += c; cb += ca; if (idx >= len) st = 7; break;
+        case 7: st = (c == ca) ? 8 : 0; break;
+        case 8:
+          if (c == cb && cls == 0x01 && id == 0x07 && len >= 92) gpsOnPvt(buf, ms);
+          st = 0;
+          break;
+      }
+    }
+  }
+  static uint32_t lastRate = 0;
+  if (ms - lastRate >= 1000) { lastRate = ms; gpsHz = gpsMsgs; gpsMsgs = 0; }
+  // no NAV-PVT for 3 s while disarmed (GPS powered later, or it restarted): set it up again
+  if (!armed && (!gpsLastMs || ms - gpsLastMs > 3000) && ms - gpsCfgMs > 3000) gpsConfigure();
+}
+
+// ---- compass ----
+bool magInit() {
+  uint8_t v = 0;
+  if (i2cRead(0x0D, 0x0D, &v, 1) && v == 0xFF) {        // QMC5883L: chip id 0xFF
+    i2cWrite8(0x0D, 0x0B, 0x01);                         // set/reset period
+    i2cWrite8(0x0D, 0x09, 0x1D);                         // continuous, 200 Hz, 8 G, OSR 512
+    magAddr = 0x0D;
+  } else if (i2cRead(0x1E, 0x0A, &v, 1) && v == 'H') {  // HMC5883L: id "H43"
+    i2cWrite8(0x1E, 0x00, 0x18);                         // 75 Hz, no averaging
+    i2cWrite8(0x1E, 0x01, 0x20);                         // +-1.3 G
+    i2cWrite8(0x1E, 0x02, 0x00);                         // continuous
+    magAddr = 0x1E;
+  } else {
+    Serial.println("Compass not found (QMC5883L 0x0D / HMC5883L 0x1E)");
+    return false;
+  }
+  Serial.printf("Compass %s found at 0x%02X%s\n", magAddr == 0x0D ? "QMC5883L" : "HMC5883L", magAddr,
+                magCfg.cal ? "" : " - NOT CALIBRATED (SETUP > GPS/COMPASS > COMPASS CAL)");
+  return true;
+}
+
+void magCalStart() {
+  if (!magOK) { setMsg("NO COMPASS"); alertEvent(0x15, 5); return; }
+  for (int i = 0; i < 3; i++) { mcMin[i] = 1e9f; mcMax[i] = -1e9f; }
+  magCalActive = true;
+  magCalT0 = millis();
+  setMsg("TURN IT EVERY WAY");
+  Serial.println("COMPASS CAL: turn the craft through every direction (nose up/down, rolled, upside down) for 45 s");
+}
+
+void magCalTick(uint32_t ms) {
+  if (!magCalActive) return;
+  if (armed || page != PAGE_SETUP) { magCalActive = false; setMsg("MAG CAL ABORTED"); return; }
+  if (ms - magCalT0 < MAG_CAL_MS) return;
+  magCalActive = false;
+  float span[3], mx = 0;
+  for (int i = 0; i < 3; i++) { span[i] = mcMax[i] - mcMin[i]; if (span[i] > mx) mx = span[i]; }
+  Serial.printf("COMPASS CAL: spans %.0f %.0f %.0f\n", span[0], span[1], span[2]);
+  if (mx < 50 || span[0] < 0.5f * mx || span[1] < 0.5f * mx || span[2] < 0.5f * mx) {
+    setMsg("CAL FAIL: TURN MORE");
+    alertEvent(0x15, 5);
+    return;
+  }
+  for (int i = 0; i < 3; i++) { magCfg.off[i] = (mcMax[i] + mcMin[i]) * 0.5f; magCfg.scl[i] = 2.0f / span[i]; }
+  magCfg.cal = 1;
+  magDirBad = false; magDirGood = magDirWrong = 0;
+  hdgInit = false;                                       // take the compass heading again
+  bool saved = saveParams();
+  setMsg(saved ? "MAG CAL OK SAVED" : "MAG CAL SAVE FAIL");
+  alertEvent(0x3, 3);
+  Serial.printf("COMPASS CAL: off %.0f %.0f %.0f  scale %.5f %.5f %.5f %s\n", magCfg.off[0], magCfg.off[1], magCfg.off[2],
+                magCfg.scl[0], magCfg.scl[1], magCfg.scl[2], saved ? "saved" : "SAVE FAILED");
+}
+
+void magTick(uint32_t ms) {
+  static uint32_t last = 0;
+  if (!magOK || ms - last < MAG_PERIOD_MS) return;
+  last = ms;
+  uint8_t d[6];
+  if (magAddr == 0x0D) {                                 // QMC: X Y Z, little endian
+    if (!i2cRead(0x0D, 0x00, d, 6)) return;
+    magRaw[0] = (int16_t)(d[0] | (d[1] << 8));
+    magRaw[1] = (int16_t)(d[2] | (d[3] << 8));
+    magRaw[2] = (int16_t)(d[4] | (d[5] << 8));
+  } else {                                               // HMC: X Z Y, big endian
+    if (!i2cRead(0x1E, 0x03, d, 6)) return;
+    magRaw[0] = (int16_t)((d[0] << 8) | d[1]);
+    magRaw[2] = (int16_t)((d[2] << 8) | d[3]);
+    magRaw[1] = (int16_t)((d[4] << 8) | d[5]);
+  }
+  if (magCalActive) for (int i = 0; i < 3; i++) { mcMin[i] = min(mcMin[i], magRaw[i]); mcMax[i] = max(mcMax[i], magRaw[i]); }
+  float c[3];
+  for (int i = 0; i < 3; i++) c[i] = (magRaw[i] - magCfg.off[i]) * magCfg.scl[i];
+  // chip -> body (x forward, y right, z down). Chip upright: X = arrow, Y = 90 deg left of it, Z up.
+  float a = c[0], b = magCfg.flip ? c[1] : -c[1], mz = magCfg.flip ? c[2] : -c[2];
+  float al = magCfg.align * 90.0f * DEG_TO_RAD;          // arrow direction, clockwise from the nose
+  float mx = a * cosf(al) - b * sinf(al), my = a * sinf(al) + b * cosf(al);
+  magLen = sqrtf(mx * mx + my * my + mz * mz);
+  float phi = roll * DEG_TO_RAD, th = -pitch * DEG_TO_RAD;   // NED: pitch + = nose up
+  float xh = mx * cosf(th) + my * sinf(phi) * sinf(th) + mz * cosf(phi) * sinf(th);
+  float yh = my * cosf(phi) - mz * sinf(phi);
+  magHdgDeg = wrap360(atan2f(-yh, xh) * RAD_TO_DEG + magCfg.decl);
+  magLastMs = ms;
+  magNew = true;
+}
+
+// every loop tick: fused heading + the compass turning-direction check + GPS speed in body axes
+void navTick(float dt, uint32_t ms) {
+  float yawRate = -gyro[2];                              // deg/s clockwise
+  hdgDeg = wrap360(hdgDeg + yawRate * dt);
+  static float gyroTurn = 0, magTurn = 0, lastMag = 0;
+  static uint32_t winStart = 0;
+  bool turning = fabsf(yawRate) > 45 && fabsf(roll) < 30 && fabsf(pitch) < 30;
+  if (turning) gyroTurn += yawRate * dt;
+  if (magNew) {
+    magNew = false;
+    if (magHealthy(ms)) {
+      if (!hdgInit) { hdgDeg = magHdgDeg; hdgInit = true; }
+      else hdgDeg = wrap360(hdgDeg + 0.01f * wrap180(magHdgDeg - hdgDeg));   // 50 Hz x 0.01 = 2 s time constant
+    }
+    // turning direction: while it turns fast and roughly level, the compass must turn the same way as the gyro
+    float dm = wrap180(magHdgDeg - lastMag);
+    lastMag = magHdgDeg;
+    if (turning) magTurn += dm;
+    if (!winStart) winStart = ms;
+    if (ms - winStart >= 1000) {
+      if (fabsf(gyroTurn) > 40) {
+        if (gyroTurn * magTurn < 0) { if (magDirWrong < 255) magDirWrong++; }
+        else if (fabsf(magTurn) > 0.5f * fabsf(gyroTurn) && magDirGood < 255) magDirGood++;
+        bool bad = magDirWrong >= 3 && magDirWrong > 2 * magDirGood;
+        if (bad && !magDirBad) { setMsg("MAG WRONG WAY"); alertEvent(0x15, 5); Serial.println("COMPASS turns the wrong way: change MAG UPSIDE DN"); }
+        magDirBad = bad;
+      }
+      gyroTurn = magTurn = 0;
+      winStart = ms;
+    }
+  }
+
+  float h = hdgDeg * DEG_TO_RAD, c = cosf(h), s = sinf(h);
+  if (gpsGood(ms)) {
+    float k = dt / (0.1f + dt);
+    gpsVelF += k * (( gpsVelN * c + gpsVelE * s) - gpsVelF);
+    gpsVelR += k * ((-gpsVelN * s + gpsVelE * c) - gpsVelR);
+  } else {
+    gpsVelF *= (1.0f - dt * 2.0f);
+    gpsVelR *= (1.0f - dt * 2.0f);
+  }
+}
+
+// arming: the home point (and the frame origin) is where it is armed, if the GPS is good then
+void navOnArm() {
+  uint32_t ms = millis();
+  homeSet = gpsGood(ms);
+  if (homeSet) { gpsSetOrigin(); setMsg("ARMED - HOME SET"); }
+  else if (gpsFound) setMsg("ARMED - NO GPS HOME");
+  Serial.printf("HOME %s (%u sats, hAcc %.1f m)\n", homeSet ? "SET" : "NOT SET", gpsSats, gpsHAcc);
+}
+
+// ---- return to home ----
+// TX: hold the button 2 s while armed (CH5 = 1850 instead of 2000), again to cancel. Radio lost with a good GPS and
+// FAILSAFE RTH on: the same, by itself (the radio coming back gives control back). Phases: CLIMB to RTH ALT M
+// (holding position), RETURN at RTH SPEED (holding height), LAND over home. On the ground the motors idle; after a
+// failsafe RTH it disarms, after a button RTH you disarm (the throttle stick must go down before it takes off again).
+uint32_t rthT0 = 0, rthPhaseT0 = 0;
+bool     rthLowLatch = false;                 // after an RTH landing: motors stay idle until the stick is down
+float    rthAltPrev = 0;
+const char *rthWhyNot(uint32_t ms) {
+  if (cfg.vehicle != VEH_QUAD)   return "RTH: QUAD ONLY";
+  if (!homeSet)                  return "RTH: NO HOME";
+  if (!gpsGood(ms))              return "RTH: GPS WEAK";
+  if (!navReady(ms))             return "RTH: COMPASS";
+  if (!altValid)                 return "RTH: NO ALT";
+  if (!inFlight || altLanded)   return "RTH: NOT FLYING";
+  return nullptr;
+}
+bool rthPossible(uint32_t ms) { return armed && !rthWhyNot(ms); }
+
+void rthSetPhase(uint8_t ph, const char *msg) {
+  rthPhase = ph;
+  rthPhaseT0 = millis();
+  rthAltPrev = altEst;
+  if (msg) setMsg(msg);
+  Serial.printf("RTH: %s (home %.1f m, alt %.1f m)\n", msg ? msg : "-", homeDist(), altEst);
+}
+
+void rthBegin(bool fs) {
+  rthFs = fs;
+  rthT0 = millis();
+  if (!altHoldActive) altHoldEngage();
+  posSrc = PSRC_GPS;
+  posReset();
+  posActive = true;
+  alertEvent(0x15, 5);
+  if (homeDist() < 3.0f) rthSetPhase(RTH_LAND, fs ? "FAILSAFE: LANDING" : "RTH: LANDING");
+  else                   rthSetPhase(RTH_CLIMB, fs ? "FAILSAFE: RTH" : "RTH: CLIMB");
+}
+
+void rthEnd(const char *why) {
+  if (!rthPhase) return;
+  rthPhase = RTH_OFF;
+  rthFs = false;
+  navClimb = 0;
+  setMsg(why);
+  alertEvent(0x5, 4);
+  Serial.printf("RTH OFF: %s\n", why);
+}
+
+// after readRC: the TX button, the phases, and the sticks RTH flies with
+void rthTick(uint32_t ms) {
+  static bool reqPrev = false;
+  bool req = rcFresh && ch[4] > 1750 && ch[4] < 1925;   // TX: armed + RTH
+  if (!armed) { rthPhase = RTH_OFF; rthFs = false; navClimb = 0; rthLowLatch = false; reqPrev = req; return; }
+  if (req && !reqPrev && !rthPhase) {
+    const char *why = rthWhyNot(ms);
+    if (why) { setMsg(why); alertEvent(0x15, 5); Serial.println(why); }
+    else rthBegin(false);
+  } else if (!req && reqPrev && rthPhase && !rthFs) rthEnd("RTH CANCELLED");
+  reqPrev = req;
+
+  if (!rthPhase) {                              // landed by RTH: idle until the throttle stick has been down
+    if (rthLowLatch) { if (ch[2] < 1100) rthLowLatch = false; else ch[2] = 1000; }
+    return;
+  }
+  if (!navReady(ms) || !altValid) {            // lost what it navigates with
+    bool fs = rthFs;
+    rthEnd(!altValid ? "RTH: ALT LOST" : "RTH: GPS LOST");
+    if (fs && altValid) {                      // radio still lost: land where it is
+      fsLanding = true; fsLandStart = ms;
+      fsLandMaxMs = max((uint32_t)FS_LAND_MAX_MS, (uint32_t)(max(altEst, 0.0f) * 1500.0f / FS_DESC_MPS) + 5000);
+    }
+    return;
+  }
+  float tgtAlt = gpsCfg.rthAltM;
+  if (ceilingOn()) tgtAlt = min(tgtAlt, altCfg.ceilingM - 0.5f);
+  uint32_t inPhase = ms - rthPhaseT0;
+  switch (rthPhase) {
+    case RTH_CLIMB:
+      navClimb = (altEst < tgtAlt - 0.3f) ? min(altCfg.maxClimb, 1.5f) : 0;
+      if (inPhase > 3000) {                    // progress check every 3 s: can not climb (full throttle?) -> go anyway
+        if (altEst - rthAltPrev < 0.2f) navClimb = 0;
+        rthAltPrev = altEst;
+        rthPhaseT0 = ms;
+      }
+      if (navClimb == 0) rthSetPhase(RTH_RETURN, rthFs ? "FAILSAFE: RTH HOME" : "RTH: GOING HOME");
+      break;
+    case RTH_RETURN:
+      navClimb = 0;
+      if (homeDist() < 1.5f && fabsf(gpsVelF) < 0.5f && fabsf(gpsVelR) < 0.5f)
+        rthSetPhase(RTH_LAND, rthFs ? "FAILSAFE: LANDING" : "RTH: LANDING");
+      else if (ms - rthT0 > 240000UL) rthSetPhase(RTH_LAND, "RTH TIMEOUT: LAND");
+      break;
+    case RTH_LAND:
+      navClimb = 0;
+      if (altLanded) {
+        bool fs = rthFs;
+        rthPhase = RTH_OFF;
+        rthFs = false;
+        rthLowLatch = true;
+        setMsg("RTH LANDED-DISARM");
+        Serial.println("RTH: landed");
+        if (fs) fsLanding = false;               // readRC: no radio + landed -> disarm
+        return;
+      }
+      break;
+  }
+  ch[0] = 1500; ch[1] = 1500;                    // roll/pitch: RTH flies (yaw stays with the pilot)
+  if (!rcFresh) ch[3] = 1500;                    // no radio: the last yaw stick must not keep turning it
+  ch[2] = (rthPhase == RTH_LAND) ? 1000 : (uint16_t)altRefThr;   // land: stick down; else stick at the hold point
 }
 
 // ======================= POSITION HOLD (optical flow) =======================
@@ -2671,16 +3243,31 @@ float posAngF = 0, posAngR = 0;            // deg, tilt commanded by position ho
 uint32_t posBadSince = 0, posGoodSince = 0, posBrakeStart = 0;
 
 bool posFlowValid(uint32_t ms) {           // can the flow be trusted for position right now?
-  return flowAlive() && (ms - flowLastMs) < 150 && flowQ >= posCfg.minQuality &&
+  return flowAlive() && (ms - flowLastMs) < 150 && flowQ >= posCfg.minQuality && !mtfDistrust &&
          mspRfFresh(ms) && mspRfHeightCm > 15.0f && mspRfHeightCm < altCfg.tofMaxM * 100.0f &&
          fabsf(roll) < 35 && fabsf(pitch) < 35;
 }
 
-void posReset() {                          // start holding right here
-  posN = posE = 0; posTgtN = posTgtE = 0;
-  posHeading = 0;
+// GPS hold: is the GPS + compass good enough to hold position with?
+bool posGpsValid(uint32_t ms) { return USE_GPS && navReady(ms) && cfg.vehicle == VEH_QUAD; }
+bool posSrcValid(uint8_t src, uint32_t ms) { return src == PSRC_GPS ? posGpsValid(ms) : (USE_MTF && posFlowValid(ms)); }
+int8_t posBestSrc(uint32_t ms) {           // optical flow first (precise low down), then GPS; -1 = none
+  if (USE_MTF && posFlowValid(ms)) return PSRC_FLOW;
+  if (posGpsValid(ms)) return PSRC_GPS;
+  return -1;
+}
+
+void posReset() {                          // start holding right here (in the frame of the current source)
+  if (posSrc == PSRC_GPS) { posTgtN = gpsN; posTgtE = gpsE; }
+  else { posN = posE = 0; posTgtN = posTgtE = 0; posHeading = 0; }
   posIF = posIR = 0;
   posBraking = false;
+}
+
+// the active source's position (m), heading (rad, clockwise) and speed over ground (m/s, body axes)
+void posState(float &pN, float &pE, float &hd, float &vF, float &vR) {
+  if (posSrc == PSRC_GPS) { pN = gpsN; pE = gpsE; hd = hdgDeg * DEG_TO_RAD; vF = gpsVelF; vR = gpsVelR; }
+  else { pN = posN; pE = posE; hd = posHeading; vF = velF; vR = velR; }
 }
 
 // every loop tick while armed: speed estimate + position (also while not holding, so it is ready)
@@ -2704,34 +3291,45 @@ void posEstimateTick(float dt, uint32_t ms) {
 }
 
 // tilt targets (deg) for position hold; sRoll / sPitch are the pilot's sticks (-1..1, + = right / forward)
+// Same controller for both sources, with the source's own gains (OPT FLOW: SETUP > POS HOLD, GPS: SETUP > GPS/COMPASS).
+// RTH moves the spot to home (RETURN, LAND) and flies there at RTH SPEED.
 void posControl(float sRoll, float sPitch, float dt, uint32_t ms) {
-  float c = cosf(posHeading), s = sinf(posHeading);
+  const bool g = posSrc == PSRC_GPS;
+  const float kPos = g ? gpsCfg.posP : posCfg.posP, kVel = g ? gpsCfg.velP : posCfg.velP, kI = g ? gpsCfg.velI : posCfg.velI;
+  const float vMax = g ? gpsCfg.maxSpeed : posCfg.maxSpeed, tiltMax = g ? gpsCfg.maxTilt : posCfg.maxTilt;
+  float pN, pE, hd, vF, vR;
+  posState(pN, pE, hd, vF, vR);
+  float c = cosf(hd), s = sinf(hd);
   bool sticks = fabsf(sRoll) > 0.08f || fabsf(sPitch) > 0.08f;
   float vtF, vtR;                                            // speed targets, body axes
   if (sticks) {                                              // pilot flies: speed command, spot follows
-    vtF = sPitch * posCfg.maxSpeed;
-    vtR = sRoll  * posCfg.maxSpeed;
-    posTgtN = posN; posTgtE = posE;
+    vtF = sPitch * vMax;
+    vtR = sRoll  * vMax;
+    posTgtN = pN; posTgtE = pE;
     posBraking = true; posBrakeStart = ms;
   } else if (posBraking) {                                   // released: brake to a stop, then take the spot
     vtF = vtR = 0;
-    posTgtN = posN; posTgtE = posE;
-    if ((fabsf(velF) < 0.15f && fabsf(velR) < 0.15f) || ms - posBrakeStart > 2000) posBraking = false;
+    posTgtN = pN; posTgtE = pE;
+    if ((fabsf(vF) < 0.15f && fabsf(vR) < 0.15f) || ms - posBrakeStart > 2000) posBraking = false;
   } else {                                                   // hold the spot
-    float eN = posTgtN - posN, eE = posTgtE - posE;
+    // drifting back to the spot is slow on purpose (the sticks still get MAX SPEED): a fast return overshoots
+    float vRet = min(vMax, g ? 1.0f : POS_RETURN_MAX);
+    if (g && (rthPhase == RTH_RETURN || rthPhase == RTH_LAND)) {   // RTH: the spot is home
+      posTgtN = 0; posTgtE = 0;
+      vRet = (rthPhase == RTH_RETURN) ? gpsCfg.rthSpeed : 1.0f;
+    }
+    float eN = posTgtN - pN, eE = posTgtE - pE;
     float eF =  eN * c + eE * s;                             // world error -> body axes
     float eR = -eN * s + eE * c;
-    // drifting back to the spot is slow on purpose (the sticks still get MAX SPEED): a fast return overshoots
-    const float vRet = min(posCfg.maxSpeed, POS_RETURN_MAX);
-    vtF = constrain(posCfg.posP * eF, -vRet, vRet);
-    vtR = constrain(posCfg.posP * eR, -vRet, vRet);
+    vtF = constrain(kPos * eF, -vRet, vRet);
+    vtR = constrain(kPos * eR, -vRet, vRet);
   }
-  float evF = vtF - velF, evR = vtR - velR;
+  float evF = vtF - vF, evR = vtR - vR;
   const float iLim = 10.0f;                                  // deg: room to cancel a steady push (trim, wind)
-  posIF = constrain(posIF + posCfg.velI * evF * dt, -iLim, iLim);
-  posIR = constrain(posIR + posCfg.velI * evR * dt, -iLim, iLim);
-  posAngF = constrain(posCfg.velP * evF + posIF, -posCfg.maxTilt, posCfg.maxTilt);
-  posAngR = constrain(posCfg.velP * evR + posIR, -posCfg.maxTilt, posCfg.maxTilt);
+  posIF = constrain(posIF + kI * evF * dt, -iLim, iLim);
+  posIR = constrain(posIR + kI * evR * dt, -iLim, iLim);
+  posAngF = constrain(kVel * evF + posIF, -tiltMax, tiltMax);
+  posAngR = constrain(kVel * evR + posIR, -tiltMax, tiltMax);
 }
 
 // Base mode comes from the stick command / menu (ACRO or SELF STAB). ALT HOLD / POS HOLD are added on top with
@@ -2747,12 +3345,20 @@ void updateMode() {
   Mode base = flightMode ? MODE_SELF : MODE_ACRO;
   uint8_t lvl = (armed && rcValid && cfg.vehicle == VEH_QUAD) ? ch6Level() : 0;
   bool want = lvl >= 1 || fsLanding;                        // POS2 or POS3: altitude hold (or failsafe landing)
-  bool wantPos = (lvl == 2) && USE_MTF;                      // POS3: + position hold (needs the MTF)
+  bool wantPos = (lvl == 2) && (USE_MTF || USE_GPS);         // POS3: + position hold (optical flow or GPS)
   avoidForced = (lvl == 2) && !USE_MTF && USE_AVOID;         // with avoidance fitted: POS3 = alt hold + avoidance on
   static uint8_t lvlPrev = 0;
   bool flipIn = want && lvl != lvlPrev;                      // the switch was just MOVED to POS2/POS3
   lvlPrev = lvl;
   uint32_t ms = millis();
+
+  if (armed && rthPhase) {                                   // RTH: alt hold + GPS hold, whatever the switch says
+    if (!altHoldActive) altHoldEngage();
+    if (!posActive || posSrc != PSRC_GPS) { posSrc = PSRC_GPS; posReset(); posActive = true; }
+    posBadSince = posGoodSince = 0;
+    mode = MODE_POS;
+    return;
+  }
 
   if (!armed) { altHoldActive = false; posActive = false; }  // disarm / failsafe: silently off
   else if (altHoldActive && !want) { posActive = false; altHoldDisengage("SELF STAB"); }
@@ -2763,49 +3369,77 @@ void updateMode() {
     alertEvent(0x5, 4);
   }
   else if (altHoldActive && wantPos && !posActive && flipIn) {   // POS2 -> POS3 in flight: add position hold
-    if (posFlowValid(ms)) { posReset(); posActive = true; setMsg("POS HOLD ON"); alertEvent(0x3, 3); }
-    else { setMsg("NO FLOW: ALT ONLY"); alertEvent(0x15, 5); }
+    int8_t src = posBestSrc(ms);
+    if (src >= 0) { posSrc = src; posReset(); posActive = true; setMsg(src == PSRC_GPS ? "GPS HOLD ON" : "POS HOLD ON"); alertEvent(0x3, 3); }
+    else { setMsg("NO FLOW/GPS: ALT ONLY"); alertEvent(0x15, 5); }
     posBadSince = posGoodSince = 0;
   }
-  else if (!altHoldActive && flipIn) {
-    // On a switch move to POS2/POS3 (arming with the switch already up counts as a move):
-    //   flying -> hold the current height, the stick position at that moment means "hold";
-    //   on the ground -> ground start: motors idle, stick above centre takes off.
+  else if (!altHoldActive && want) {
+    // Switch in POS2/POS3 and not holding yet. This is checked all the time, not only when the switch moves: arming
+    // restarts the altitude estimate, so at that moment there is no altitude for one tick. Refusing once there left
+    // a takeoff with the switch already up in SELF STAB for the whole flight.
+    //   flying -> hold the current height;
+    //   on the ground -> ground start: motors idle, stick above the hold zone takes off.
+    static uint32_t noAltSince = 0;
+    static bool noAltTold = false;
     const char *why = nullptr;
-    if (!altValid) why = "NO ALT SENSOR";
-    if (!why && (!inFlight || ch[2] < 1150)) {
+    if (!altValid) {
+      why = "NO ALT SENSOR";
+      if (!noAltSince) noAltSince = ms ? ms : 1;
+    } else { noAltSince = 0; noAltTold = false; }
+    if (!why && (!inFlight || (flipIn && ch[2] < 1150))) {
       altHoldEngageGround();
     } else if (!why) {
       altHoldEngage();
       if (wantPos) {
-        if (posFlowValid(ms)) { posReset(); posActive = true; setMsg("POS HOLD ON"); }
-        else { posActive = false; setMsg("NO FLOW: ALT ONLY"); alertEvent(0x15, 5); }
+        int8_t src = posBestSrc(ms);
+        if (src >= 0) { posSrc = src; posReset(); posActive = true; setMsg(src == PSRC_GPS ? "GPS HOLD ON" : "POS HOLD ON"); }
+        else { posActive = false; setMsg("NO FLOW/GPS: ALT ONLY"); alertEvent(0x15, 5); }
         posBadSince = posGoodSince = 0;
       }
-    } else {
+    } else if (!noAltTold && ms - noAltSince > 1000) {
+      noAltTold = true;
       setMsg(why);
-      alertEvent(0x15, 5);                                    // three beeps: refused
-      Serial.printf("HOLD refused: %s\n", why);
+      alertEvent(0x15, 5);                                    // three beeps: still no altitude after 1 s
+      Serial.printf("HOLD waiting: %s\n", why);
     }
   }
 
-  // while holding in POS HOLD: drop to ALT HOLD when the flow goes bad, resume when it is good again
-  if (altHoldActive && wantPos) {
-    bool good = posFlowValid(ms);
+  // while holding in POS HOLD: the source goes bad -> the other source, or ALT HOLD; back when one is good again.
+  // GPS hold hands over to the optical flow once the flow has been good for 1 s (more precise, low down).
+  if (altHoldActive && altLanded) {                          // on the ground: no position hold (the GPS is valid there
+    posActive = false;                                       // and its integrators would wind up before takeoff)
+    posBadSince = posGoodSince = 0;
+  } else if (altHoldActive && wantPos) {
+    int8_t best = posBestSrc(ms);
+    bool good = posActive ? posSrcValid(posSrc, ms) : best >= 0;
     if (good) { posBadSince = 0; if (!posGoodSince) posGoodSince = ms ? ms : 1; }
     else      { posGoodSince = 0; if (!posBadSince) posBadSince = ms ? ms : 1; }
     if (posActive && posBadSince && ms - posBadSince > 300) {
-      posActive = false;
-      setMsg("FLOW LOST-ALT HOLD");
-      alertEvent(0x5, 4);
-      Serial.println("POS HOLD: flow lost, ALT HOLD only");
+      if (best >= 0 && best != posSrc) {
+        posSrc = best; posReset();
+        setMsg(best == PSRC_GPS ? "FLOW LOST-GPS HOLD" : "GPS LOST-FLOW HOLD");
+        Serial.printf("POS HOLD: now on %s\n", best == PSRC_GPS ? "GPS" : "optical flow");
+        posBadSince = 0;
+      } else {
+        posActive = false;
+        setMsg(posSrc == PSRC_GPS ? "GPS LOST-ALT HOLD" : "FLOW LOST-ALT HOLD");
+        alertEvent(0x5, 4);
+        Serial.println("POS HOLD: position lost, ALT HOLD only");
+      }
     } else if (!posActive && posGoodSince && ms - posGoodSince > 1000) {
+      posSrc = best;
       posReset();
       posActive = true;
-      setMsg("POS HOLD BACK");
+      setMsg(posSrc == PSRC_GPS ? "GPS HOLD BACK" : "POS HOLD BACK");
       alertEvent(0x3, 3);
-      Serial.println("POS HOLD: flow good again, holding here");
+      Serial.println("POS HOLD: position good again, holding here");
     }
+    static uint32_t flowGoodSince = 0;                       // on GPS: back to the flow when it is good for 1 s
+    if (posActive && posSrc == PSRC_GPS && USE_MTF && posFlowValid(ms)) {
+      if (!flowGoodSince) flowGoodSince = ms ? ms : 1;
+      if (ms - flowGoodSince > 1000) { posSrc = PSRC_FLOW; posReset(); setMsg("FLOW HOLD"); Serial.println("POS HOLD: GPS -> optical flow"); }
+    } else flowGoodSince = 0;
   }
   mode = altHoldActive ? (posActive ? MODE_POS : MODE_ALT) : base;
 }
@@ -2926,7 +3560,7 @@ void telemetryTick(uint32_t ms) {
   t.magic = PKT_MAGIC;
   t.bindId = BIND_ID;
   t.armed = armed;
-  t.mode = (mode == MODE_ACRO) ? 1 : (mode == MODE_ALT ? 2 : (mode == MODE_POS ? 3 : 0));   // 0 self, 1 acro, 2 alt, 3 pos
+  t.mode = rthPhase ? 4 : (mode == MODE_ACRO) ? 1 : (mode == MODE_ALT ? 2 : (mode == MODE_POS ? 3 : 0));   // 0 self, 1 acro, 2 alt, 3 pos, 4 RTH
   t.armBlock = armed ? AB_NONE : armBlock;
   t.roll10 = (int16_t)constrain(roll * 10.0f, -32000.0f, 32000.0f);
   t.pitch10 = (int16_t)constrain(pitch * 10.0f, -32000.0f, 32000.0f);
@@ -2939,6 +3573,22 @@ void telemetryTick(uint32_t ms) {
   t.lq = rcLq;
   t.crc = crc8((const uint8_t *)&t, sizeof(t) - 1);
   esp_now_send(txMac, (const uint8_t *)&t, sizeof(t));
+#if USE_GPS
+  static uint8_t gpsDiv = 0;                 // GPS packet at 5 Hz (other size: TXs that do not know it ignore it)
+  if (++gpsDiv >= 4) {
+    gpsDiv = 0;
+    GpsTelemetry g;
+    g.magic = GPS_TLM_MAGIC;
+    g.bindId = BIND_ID;
+    g.sats = gpsSats;
+    g.flags = (gpsGood(ms) ? 1 : 0) | (homeSet ? 2 : 0) | (magHealthy(ms) ? 4 : 0) | (rthPhase ? 8 : 0)
+            | ((posActive && posSrc == PSRC_GPS) ? 16 : 0) | (magOK ? 32 : 0) | (gpsFound ? 64 : 0);
+    g.distHome = (uint16_t)constrain(homeDist(), 0.0f, 65000.0f);
+    g.alt10 = (int16_t)constrain(altEst * 10.0f, -32000.0f, 32000.0f);
+    g.crc = crc8((const uint8_t *)&g, sizeof(g) - 1);
+    esp_now_send(txMac, (const uint8_t *)&g, sizeof(g));
+  }
+#endif
 }
 
 // ======================= CONTROL =======================
@@ -2990,6 +3640,18 @@ void runControl(float dt) {
   float yawRateSet = stickToRate(sYaw, T.rcYawC, T.rcYawMax, T.rcYawExpo);     // RC rates
   float rollRateSet, pitchRateSet;
 
+  // HEADING HOLD (SELF / ALT / POS, flying): yaw stick centred -> hold the nose direction (compass-corrected heading).
+  // The direction is taken 0.3 s after the stick is released, when the turn has stopped.
+  {
+    static float hdgTgt = 0;
+    static uint32_t yawMovedMs = 0;
+    uint32_t ms = millis();
+    bool hh = gpsCfg.hdgHold && quad && mode != MODE_ACRO && inFlight && thrIn > 1100;
+    if (!hh || fabsf(sYaw) > 0.02f) { yawMovedMs = ms; hdgTgt = hdgDeg; }
+    else if (ms - yawMovedMs < 300) hdgTgt = hdgDeg;
+    else yawRateSet = constrain(-gpsCfg.hdgP * wrap180(hdgTgt - hdgDeg), -90.0f, 90.0f);   // + = CCW
+  }
+
   static bool lastLevel = true;                      // SELF STAB and ALT HOLD both self-level
   bool level = (mode != MODE_ACRO);
   if (level != lastLevel) {                          // start the self-level PIDs fresh when entering it
@@ -3004,7 +3666,7 @@ void runControl(float dt) {
     float rollTarget  = expoCurve(sRoll,  T.lvExpo) * T.lvAngle;
     float pitchTarget = expoCurve(sPitch, T.lvExpo) * T.lvAngle;
     if (mode == MODE_POS) {                          // position hold: the sticks command speed, not tilt
-      posControl(sRoll, sPitch, dt, millis());
+      posControl(rthPhase ? 0 : sRoll, rthPhase ? 0 : sPitch, dt, millis());   // RTH flies by itself
       rollTarget = posAngR;
       pitchTarget = posAngF;
     }
@@ -3118,7 +3780,8 @@ void drawStatus() {
     u8g2.drawFrame(0, 0, 54, 12);
     u8g2.drawStr(5, 10, "DISARM");
   }
-  u8g2.drawStr(62, 10, mode == MODE_ACRO ? "ACRO" : (mode == MODE_ALT ? "ALT HOLD" : (mode == MODE_POS ? "POS HOLD" : "SELF STAB")));
+  u8g2.drawStr(62, 10, rthPhase ? "RTH" : mode == MODE_ACRO ? "ACRO" : (mode == MODE_ALT ? "ALT HOLD" :
+                       (mode == MODE_POS ? (posSrc == PSRC_GPS ? "GPS HOLD" : "POS HOLD") : "SELF STAB")));
 
   snprintf(b, sizeof b, "ROLL  %+6.1f", roll);   u8g2.drawStr(0, 24, b);
   snprintf(b, sizeof b, "PITCH %+6.1f", pitch);  u8g2.drawStr(0, 35, b);
@@ -3289,6 +3952,9 @@ void drawMenu() {
     if (altValid) snprintf(b, sizeof b, "%+5.2fm", altEst);
     else          snprintf(b, sizeof b, "NO ALT");
     u8g2.drawStr(86, 10, b);
+  } else if (curMenu == SUB_GPS) {           // live satellites + compass heading
+    snprintf(b, sizeof b, "%2us %3.0f", gpsSats, magOK ? magHdgDeg : 0.0f);
+    u8g2.drawStr(80, 10, b);
   } else if (curMenu == SUB_FILT) {          // live vibration level, to judge the filter settings
     snprintf(b, sizeof b, "VIB%5.1f", vibrationRms());
     u8g2.drawStr(74, 10, b);
@@ -3320,6 +3986,10 @@ void drawMenu() {
   if (levelCalLeft > 0)    u8g2.drawStr(0, 63, "CALIBRATING - HOLD STILL");
   else if (flowCalActive) {
     snprintf(b, sizeof b, "ROCK ROLL+PITCH  %lus", (unsigned long)((FLOW_CAL_MS - (millis() - flowCalT0)) / 1000 + 1));
+    u8g2.drawStr(0, 63, b);
+  }
+  else if (magCalActive) {
+    snprintf(b, sizeof b, "TURN EVERY WAY  %lus", (unsigned long)((MAG_CAL_MS - (millis() - magCalT0)) / 1000 + 1));
     u8g2.drawStr(0, 63, b);
   }
   else if (millis() < msgUntil) u8g2.drawStr(0, 63, msgText);
@@ -3430,6 +4100,37 @@ void drawFlow() {
   u8g2.drawStr(0, 64, b);
 }
 
+void drawGps() {
+  char b[28];
+  uint32_t ms = millis();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  if (!gpsFound) {
+    u8g2.drawStr(0, 9, "GPS");
+    u8g2.drawHLine(0, 11, 128);
+    u8g2.drawStr(0, 23, gpsNmeaMs ? "NMEA only: GPS RX" : "NO DATA on GPIO21");
+    u8g2.drawStr(0, 34, gpsNmeaMs ? "wire <- GPIO10?" : "TX->1k->21 RX<-10");
+  } else {
+    snprintf(b, sizeof b, "GPS %s %2usat %2uHz", gpsFix >= 3 ? "3D" : (gpsFix == 2 ? "2D" : "--"), gpsSats, gpsHz);
+    u8g2.drawStr(0, 9, b);
+    u8g2.drawHLine(0, 11, 128);
+    snprintf(b, sizeof b, "acc %4.1fm %s", gpsHAcc, gpsGood(ms) ? "GOOD" : "weak");
+    u8g2.drawStr(0, 23, b);
+    if (homeSet) snprintf(b, sizeof b, "HOME %4.0fm N%+.0f E%+.0f", homeDist(), gpsN, gpsE);
+    else         snprintf(b, sizeof b, "HOME: set when armed");
+    u8g2.drawStr(0, 34, b);
+  }
+  if (!magOK)             snprintf(b, sizeof b, "NO COMPASS 0x0D/1E");
+  else if (!magCfg.cal)   snprintf(b, sizeof b, "MAG %3.0f NOT CALIBR.", magHdgDeg);
+  else if (magDirBad)     snprintf(b, sizeof b, "MAG WRONG WAY: FLIP");
+  else                    snprintf(b, sizeof b, "MAG %3.0f HDG %3.0f %s", magHdgDeg, hdgDeg, magHealthy(ms) ? "ok" : "?");
+  u8g2.drawStr(0, 46, b);
+  u8g2.setFont(u8g2_font_5x7_tf);
+  snprintf(b, sizeof b, "|m| %.2f  %s", magLen, navReady(ms) ? "GPS HOLD+RTH READY" : "not ready");
+  u8g2.drawStr(0, 55, b);
+  snprintf(b, sizeof b, "%.6f %.6f", gpsLat * 1e-7, gpsLon * 1e-7);
+  u8g2.drawStr(0, 64, b);
+}
+
 void drawSensors() {
   char b[28];
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -3457,6 +4158,7 @@ void renderFrame() {
   else if (page == PAGE_SENSORS) drawSensors();
   else if (page == PAGE_ALT) drawAlt();
   else if (page == PAGE_FLOW) drawFlow();
+  else if (page == PAGE_GPS) drawGps();
   else drawMenu();
 }
 
@@ -3568,12 +4270,23 @@ void setup() {
   Wire.setClock(I2C_HZ);                    // fast bus for the 500 Hz loop (IMU read was 0.8 ms at 400 kHz)
 #if USE_MTF
   Serial1.setRxBufferSize(512);             // optical flow module (MSP) - must be set before begin()
-  Serial1.begin(FLOW_BAUD, SERIAL_8N1, FLOW_RX_PIN, FLOW_TX_PIN);
+  Serial1.begin(FLOW_BAUD, SERIAL_8N1, FLOW_RX_PIN, USE_GPS ? -1 : FLOW_TX_PIN);   // with GPS: GPIO10 is the GPS's
+#endif
+#if USE_GPS
+  magOK = magInit();                        // compass on the I2C bus
+  Serial0.setRxBufferSize(512);
+  Serial0.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);   // UART0 moved to GPIO21 (RX) / GPIO10 (TX)
+#if USE_BUZZER
+  pinMode(PIN_BUZZ, OUTPUT);                // GPIO20 is UART0's default RX: make sure it stays the buzzer
+#endif
 #endif
 
   splash("Calibrating gyro", "keep still...");
   calibrateGyro();
 
+#if USE_GPS
+  gpsConfigure();                           // GPS: 115200, UBX NAV-PVT, 10 Hz (the GPS has booted by now)
+#endif
   radioBegin();                             // ESP-NOW link to the transmitter
   resetPIDs();
   alertEvent(0x1, 3);                       // one beep: ready
@@ -3610,6 +4323,14 @@ struct __attribute__((packed)) RecSample {
                                 // tofCm -100-n = VL53L1X answers but rejects the reading with range status n
   int8_t   rssi;                // dBm the FC receives the TX with (smoothed)
   uint8_t  lq;                  // radio link quality, %
+  uint8_t  sats;                // GPS satellites used
+  uint8_t  nav;                 // bit0 POS HOLD on GPS, bits1-2 RTH phase, bit3 home set, bit4 compass healthy, bit5 GPS good
+  int16_t  gpsN10, gpsE10;      // GPS position from home, dm
+  uint16_t hdg10;               // fused heading, deg x10
+  int16_t  accUp100, accCorr100; // vertical acceleration (gravity removed) and its learned offset, cm/s^2
+  int16_t  velEst100;           // vertical speed estimate, cm/s
+  int16_t  altTgt100;           // ALT HOLD target height, cm
+  int16_t  altInteg10;          // ALT HOLD VEL I correction, us x10
 };
 RecSample recBuf[REC_N];
 uint16_t recHead = 0, recCount = 0;
@@ -3657,12 +4378,20 @@ void recTick(uint32_t ms, uint16_t ctrlUs) {
   s.ctrlUs = ctrlUs;
   s.alt100 = (int16_t)constrain(altEst * 100, -32000.0f, 32000.0f);
   {
-    float c = cosf(posHeading), sn = sinf(posHeading), eN = posTgtN - posN, eE = posTgtE - posE;
+    float pN, pE, hd, vF, vR;
+    posState(pN, pE, hd, vF, vR);
+    float c = cosf(hd), sn = sinf(hd), eN = posTgtN - pN, eE = posTgtE - pE;
     s.posErrF = posActive ? (int16_t)constrain(( eN * c + eE * sn) * 100, -32000.0f, 32000.0f) : 0;
     s.posErrR = posActive ? (int16_t)constrain((-eN * sn + eE * c) * 100, -32000.0f, 32000.0f) : 0;
-    s.velF100 = (int16_t)constrain(velF * 100, -32000.0f, 32000.0f);
-    s.velR100 = (int16_t)constrain(velR * 100, -32000.0f, 32000.0f);
+    s.velF100 = (int16_t)constrain(vF * 100, -32000.0f, 32000.0f);
+    s.velR100 = (int16_t)constrain(vR * 100, -32000.0f, 32000.0f);
   }
+  s.sats = gpsSats;
+  s.nav = (uint8_t)(((posActive && posSrc == PSRC_GPS) ? 1 : 0) | ((rthPhase & 3) << 1) | (homeSet ? 8 : 0) |
+                    (magHealthy(ms) ? 16 : 0) | (gpsGood(ms) ? 32 : 0));
+  s.gpsN10 = (int16_t)constrain(gpsN * 10, -32000.0f, 32000.0f);
+  s.gpsE10 = (int16_t)constrain(gpsE * 10, -32000.0f, 32000.0f);
+  s.hdg10 = (uint16_t)(hdgDeg * 10);
   s.flags = (uint8_t)((mode & 3) | (avoiding ? 4 : 0) | (altValid ? 8 : 0) | ((altSrc & 3) << 4));
   s.vib10 = (uint8_t)constrain(vibrationRms() * 10, 0.0f, 255.0f);
   s.accR10 = (int16_t)constrain(accRollDeg * 10, -32000.0f, 32000.0f);
@@ -3672,6 +4401,11 @@ void recTick(uint32_t ms, uint16_t ctrlUs) {
           : (tofOK && ms - tofLastData < 250) ? (int16_t)(-100 - tofStatus) : -1;
   s.rssi = (int8_t)lroundf(rcRssiF);
   s.lq = rcLq;
+  s.accUp100 = (int16_t)constrain(accUpMs2 * 100, -32000.0f, 32000.0f);
+  s.accCorr100 = (int16_t)constrain(accCorr * 100, -32000.0f, 32000.0f);
+  s.velEst100 = (int16_t)constrain(velEst * 100, -32000.0f, 32000.0f);
+  s.altTgt100 = (int16_t)constrain(altTarget * 100, -32000.0f, 32000.0f);
+  s.altInteg10 = (int16_t)constrain(altInteg * 10, -32000.0f, 32000.0f);
   recHead = (recHead + 1) % REC_N;
   if (recCount < REC_N) recCount++;
 }
@@ -3693,15 +4427,18 @@ void recDump() {                                  // CSV over USB, oldest sample
     if (f) f.close();
   }
   Serial.printf("REC BEGIN %u samples, %u ms apart, from %s\n", recCount, REC_MS, fromFlash ? "flash" : "RAM");
-  Serial.println("t_s,roll,pitch,rollT,pitchT,gR,gP,gY,thr,rcR,rcP,rcY,m1,m2,m3,m4,vbat,ctrl_us,alt_m,mode,avoid,vib,posErrF_cm,posErrR_cm,velF_cms,velR_cms,accR,accP,altsrc,mtf_cm,tof_cm,rssi,lq");
+  Serial.println("t_s,roll,pitch,rollT,pitchT,gR,gP,gY,thr,rcR,rcP,rcY,m1,m2,m3,m4,vbat,ctrl_us,alt_m,mode,avoid,vib,posErrF_cm,posErrR_cm,velF_cms,velR_cms,accR,accP,altsrc,mtf_cm,tof_cm,rssi,lq,sats,gpsN_m,gpsE_m,hdg,gpshold,rth,home,magok,gpsok,accUp,accCorr,velEst,altTgt,altInteg");
   uint16_t start = (recCount < REC_N) ? 0 : recHead;
   for (uint16_t k = 0; k < recCount; k++) {
     const RecSample &s = recBuf[(start + k) % REC_N];
-    Serial.printf("%.2f,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.2f,%u,%.2f,%u,%u,%.1f,%d,%d,%d,%d,%.1f,%.1f,%u,%d,%d,%d,%u\n",
+    Serial.printf("%.2f,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.2f,%u,%.2f,%u,%u,%.1f,%d,%d,%d,%d,%.1f,%.1f,%u,%d,%d,%d,%u,%u,%.1f,%.1f,%.1f,%u,%u,%u,%u,%u,%.2f,%.2f,%.2f,%.2f,%.1f\n",
                   s.t10 / 100.0f, s.roll10 / 10.0f, s.pitch10 / 10.0f, s.rollT10 / 10.0f, s.pitchT10 / 10.0f,
                   s.gR, s.gP, s.gY, s.thr, s.rcR, s.rcP, s.rcY, s.m[0], s.m[1], s.m[2], s.m[3],
                   s.vbat100 / 100.0f, s.ctrlUs, s.alt100 / 100.0f, s.flags & 3, (s.flags >> 2) & 1, s.vib10 / 10.0f,
-                  s.posErrF, s.posErrR, s.velF100, s.velR100, s.accR10 / 10.0f, s.accP10 / 10.0f, (s.flags >> 4) & 3, s.mtfCm, s.tofCm, s.rssi, s.lq);
+                  s.posErrF, s.posErrR, s.velF100, s.velR100, s.accR10 / 10.0f, s.accP10 / 10.0f, (s.flags >> 4) & 3, s.mtfCm, s.tofCm, s.rssi, s.lq,
+                  s.sats, s.gpsN10 / 10.0f, s.gpsE10 / 10.0f, s.hdg10 / 10.0f, s.nav & 1, (s.nav >> 1) & 3, (s.nav >> 3) & 1,
+                  (s.nav >> 4) & 1, (s.nav >> 5) & 1,
+                  s.accUp100 / 100.0f, s.accCorr100 / 100.0f, s.velEst100 / 100.0f, s.altTgt100 / 100.0f, s.altInteg10 / 10.0f);
     if ((k & 31) == 31) delay(2);
   }
   Serial.println("REC END");
@@ -3744,20 +4481,29 @@ void loop() {
   // ----- flight loop -----
   PROF_MARK(0);
   readRC();
+#if USE_GPS
+  rthTick(millis());                        // return to home: TX button, phases, its stick commands
+#endif
   batteryTick(millis());
   updateFlightState();
   PROF_MARK(1);
   readIMU(dt);
   PROF_MARK(2);
-  {                                         // altitude sensors: one of them per tick, only when due
-    static bool baroTurn = false;
-    baroTurn = !baroTurn;
-    if (baroTurn) baroTick(millis());
-    else          tofTick(millis());
+  {                                         // I2C sensors: one of them per tick, only when due
+    static uint8_t turn = 0;
+    turn = (turn + 1) % 3;
+    if (turn == 0)      baroTick(millis());
+    else if (turn == 1) tofTick(millis());
+#if USE_GPS
+    else                magTick(millis());
+#endif
   }
   PROF_MARK(3);
 #if USE_MTF
   mspPoll();                                // optical flow + rangefinder module (MSP)
+#endif
+#if USE_GPS
+  gpsPoll(millis());                        // GPS (UBX)
 #endif
   PROF_MARK(4);
   avoidTick(millis());                      // forward VL53L1X obstacle check
@@ -3765,6 +4511,10 @@ void loop() {
   altEstTick(dt, millis());                 // fused altitude + vertical speed
 #if USE_MTF
   posEstimateTick(dt, millis());            // speed over ground + position (optical flow)
+#endif
+#if USE_GPS
+  navTick(dt, millis());                    // heading (gyro + compass), GPS speed in body axes
+  magCalTick(millis());                     // COMPASS CAL (when running)
 #endif
   PROF_MARK(5);
   levelCalTick();
@@ -3825,8 +4575,16 @@ void loop() {
     if (baroOK) Serial.printf("| ALT %+.2fm ", baroAlt);
     if (altValid) Serial.printf("| EST %+.2fm %+.2fm/s %s ", altEst, velEst, altSrcName());
     if (altHoldActive) Serial.printf("| HOLD tgt %+.2f thr %.0f ", altTarget, altThrOut);
+    if (mtfDistrust || vl53Distrust) Serial.printf("| %s BLOCKED? ", mtfDistrust ? "MTF" : "VL53");
     Serial.printf("| BATCOMP x%.3f hover %.0f ", batComp(), hoverPoint());
-    if (posActive) Serial.printf("| POS N%+.2f E%+.2f err %+.2f %+.2f tilt F%+.1f R%+.1f ", posN, posE, posTgtN - posN, posTgtE - posE, posAngF, posAngR);
+    if (posActive && posSrc == PSRC_FLOW) Serial.printf("| POS N%+.2f E%+.2f err %+.2f %+.2f tilt F%+.1f R%+.1f ", posN, posE, posTgtN - posN, posTgtE - posE, posAngF, posAngR);
+#if USE_GPS
+    if (posActive && posSrc == PSRC_GPS) Serial.printf("| GPSHOLD err %+.1f %+.1f tilt F%+.1f R%+.1f ", posTgtN - gpsN, posTgtE - gpsE, posAngF, posAngR);
+    if (rthPhase) Serial.printf("| RTH %u home %.1fm ", rthPhase, homeDist());
+    if (gpsFound) Serial.printf("| GPS fix%u %us %.1fm N%+.1f E%+.1f v%+.1f %+.1f %uHz ", gpsFix, gpsSats, gpsHAcc, gpsN, gpsE, gpsVelN, gpsVelE, gpsHz);
+    else          Serial.print(gpsNmeaMs ? "| GPS NMEA ONLY (RX wire?) " : "| GPS NO DATA ");
+    if (magOK) Serial.printf("| MAG %.0f |m|%.2f HDG %.0f%s%s ", magHdgDeg, magLen, hdgDeg, magCfg.cal ? "" : " NOCAL", magDirBad ? " WRONGWAY" : "");
+#endif
     Serial.printf("| GVEL F%+.2f R%+.2f GZ%+.1f ", velF, velR, gyro[2]);
     if (flowAlive()) Serial.printf("| FLOW q%u raw %ld %ld comp %+.2f %+.2f vel %+.2f %+.2f ",
                                    flowQ, (long)flowRawX, (long)flowRawY, flowCompF, flowCompR, flowVelF, flowVelR);

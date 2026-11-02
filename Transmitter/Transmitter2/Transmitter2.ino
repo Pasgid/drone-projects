@@ -2,7 +2,9 @@
   ESP32-C3 Zero - 6 Channel ESP-NOW Transmitter
   ---------------------------------------------
   - 2 analog gimbals (4 pots), Mode 2: left = throttle/yaw, right = pitch/roll
-  - 1 push button: short press = ARM / DISARM (throttle low), long press = MENU
+  - 1 push button: short press = ARM / DISARM (throttle low), long press = MENU (disarmed)
+    Armed: hold the button 2 s = RETURN TO HOME on / off (FC with GPS; CH5 1850 instead of 2000). Any shorter
+    press disarms, as before.
   - 1.3" 128x64 SH1106 I2C OLED (SSD1306 also supported, see OLED_IS_SSD1306): live bars for all 6 channels + link quality + FC status
   - On-screen menu driven by the RIGHT stick:
         up/down    = move through the menu
@@ -20,8 +22,12 @@
 
   Channels sent:  CH1 THR | CH2 ROLL | CH3 PITCH | CH4 YAW | CH5 AUX1 = ARM (button or switch) | CH6 = 3-pos switch
 
+  SIM MODE (menu > "Sim mode (BT)"): the TX restarts as a Bluetooth gamepad "ESP-NOW TX Sim" for FPV simulators
+  (radio off). Axes X roll, Y pitch, Z throttle, RZ yaw, RX arm, RY CH6 switch; buttons 1 arm, 2 switch POS2, 3 switch POS3.
+  Power-cycle (or menu > "Sim mode (BT)" = EXIT) to go back to flying.
+
   Board: "ESP32C3 Dev Module", USB CDC On Boot: Enabled
-  Libraries: Adafruit SH110X (or Adafruit SSD1306 for a 0.96" SSD1306), Adafruit GFX
+  Libraries: Adafruit SH110X (or Adafruit SSD1306 for a 0.96" SSD1306), Adafruit GFX, ESP32-BLE-Gamepad (+ NimBLE-Arduino)
 */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -31,6 +37,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
+#include <BleGamepad.h>
 // 1.3" OLEDs are almost always SH1106; 0.96" ones are SSD1306. Uncomment for an SSD1306:
 //#define OLED_IS_SSD1306
 #if defined(OLED_IS_SSD1306)
@@ -121,6 +128,18 @@ struct __attribute__((packed)) TelemetryPacket {
   uint8_t  crc;
 };
 
+// GPS state from the FC (5 Hz, its own size)
+static const uint16_t GPS_TLM_MAGIC = 0xC3F5;
+struct __attribute__((packed)) GpsTelemetry {
+  uint16_t magic;
+  uint8_t  bindId;
+  uint8_t  sats;
+  uint8_t  flags;     // bit0 GPS good, 1 home set, 2 compass OK, 3 RTH, 4 GPS hold, 5 compass found, 6 GPS data
+  uint16_t distHome;  // m
+  int16_t  alt10;     // dm
+  uint8_t  crc;
+};
+
 // Types used in function signatures must be declared before the first function
 // (the Arduino IDE inserts auto-generated prototypes there).
 struct Settings {
@@ -144,7 +163,7 @@ struct Settings {
 };
 static const size_t SETTINGS_V1_SIZE = offsetof(Settings, vRatio100);   // saves from older versions
 static const size_t SETTINGS_V2_SIZE = offsetof(Settings, dbRP);
-enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
+enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG, BTN_LONG_UP, BTN_HOLD2 };   // LONG at 0.8 s, HOLD2 at 2 s, LONG_UP = released in between
 
 static uint8_t crc8(const uint8_t *d, size_t n) {
   uint8_t c = 0;
@@ -238,7 +257,9 @@ static volatile uint16_t rawAxis[4];
 static volatile float    stickPos[4];       // calibrated + reversed, no expo: -1..1 (thr 0..1)
 static volatile uint16_t chOut[NUM_CH] = {1000, 1500, 1500, 1500, 1000, 1000};
 static volatile bool     armRequest = false;
+static volatile bool     rthRequest = false;  // armed + return to home (hold the button 2 s)
 static volatile bool     forceSafe  = true;  // true while in menu / calibration / boot
+static bool              simMode    = false; // Bluetooth gamepad for simulators instead of ESP-NOW
 static volatile uint8_t  ch6Pos     = 0;     // 0 = DISARM, 1 = ARM, 2 = ARM + extra (debounced switch)
 static volatile float    txVbat     = 0;     // TX battery voltage, filtered (V), measured in the radio task
 static volatile float    txPinMv    = 0;     // raw pin voltage (mV)
@@ -335,7 +356,17 @@ static uint8_t       fcMac[6];
 static volatile bool fcMacKnown = false;
 static bool          fcPeerAdded = false;
 
+static GpsTelemetry      gtel;
+static volatile uint32_t lastGpsMs = 0;
+
 static void handleTelem(const uint8_t *mac, const uint8_t *data, int len, int8_t rssi) {
+  if (len == sizeof(GpsTelemetry)) {
+    GpsTelemetry g;
+    memcpy(&g, data, sizeof(g));
+    if (g.magic != GPS_TLM_MAGIC || g.bindId != BIND_ID || crc8((const uint8_t *)&g, sizeof(g) - 1) != g.crc) return;
+    portENTER_CRITICAL(&stMux); gtel = g; lastGpsMs = millis(); portEXIT_CRITICAL(&stMux);
+    return;
+  }
   if (len != sizeof(TelemetryPacket)) return;
   TelemetryPacket t;
   memcpy(&t, data, sizeof(t));
@@ -433,7 +464,7 @@ static void radioTask(void *) {
       ch[CH_THR] = 1000;
       ch[CH_ROLL] = ch[CH_PITCH] = ch[CH_YAW] = 1500;
     }
-    ch[CH_AUX1] = arm ? 2000 : 1000;
+    ch[CH_AUX1] = arm ? (rthRequest ? 1850 : 2000) : 1000;   // 1850 = armed + RTH
     ch[CH_AUX2] = 1000 + 500 * ch6Pos;   // 3-position switch: 1000 / 1500 / 2000
 
     pkt.seq++;
@@ -447,7 +478,7 @@ static void radioTask(void *) {
       fp.encrypt = false;
       fcPeerAdded = (esp_now_add_peer(&fp) == ESP_OK) || esp_now_is_peer_exist(fcMac);
     }
-    esp_now_send(fcPeerAdded ? fcMac : BCAST, (const uint8_t *)&pkt, sizeof(pkt));
+    if (!simMode) esp_now_send(fcPeerAdded ? fcMac : BCAST, (const uint8_t *)&pkt, sizeof(pkt));
 
     portENTER_CRITICAL(&stMux);
     for (int i = 0; i < 4; i++) { rawAxis[i] = raw[i]; stickPos[i] = pos[i]; }
@@ -495,17 +526,19 @@ static void radioBegin() {
 
 // ====================== BUTTON ======================
 static BtnEvent pollButton() {
-  static bool stable = HIGH, lastRead = HIGH, longFired = false;
+  static bool stable = HIGH, lastRead = HIGH, longFired = false, holdFired = false;
   static uint32_t changeMs = 0, pressMs = 0;
   uint32_t now = millis();
   bool r = digitalRead(PIN_BTN);
   if (r != lastRead) { lastRead = r; changeMs = now; }
   if (now - changeMs > 25 && r != stable) {
     stable = r;
-    if (stable == LOW) { pressMs = now; longFired = false; }
+    if (stable == LOW) { pressMs = now; longFired = holdFired = false; }
     else if (!longFired) return BTN_SHORT;
+    else if (!holdFired) return BTN_LONG_UP;
   }
   if (stable == LOW && !longFired && now - pressMs > 800) { longFired = true; return BTN_LONG; }
+  if (stable == LOW && longFired && !holdFired && now - pressMs > 2000) { holdFired = true; return BTN_HOLD2; }
   return BTN_NONE;
 }
 
@@ -530,13 +563,13 @@ static void showMsg(const char *m, uint32_t ms = 1200) {
 enum MenuItem {
   MI_RATE, MI_EXPO, MI_TRIM_R, MI_TRIM_P, MI_TRIM_Y,
   MI_REV_T, MI_REV_R, MI_REV_P, MI_REV_Y, MI_DB_RP, MI_DB_Y, MI_DB_T, MI_FILT, MI_CALIB, MI_BUZZ,
-  MI_VRATIO, MI_CELLS, MI_WARN, MI_SAVE, MI_EXIT, MI_COUNT
+  MI_VRATIO, MI_CELLS, MI_WARN, MI_SIM, MI_SAVE, MI_EXIT, MI_COUNT
 };
 static const char *MENU_LABEL[MI_COUNT] = {
   "Rates", "Expo", "Trim roll", "Trim pitch", "Trim yaw",
   "Rev throttle", "Rev roll", "Rev pitch", "Rev yaw",
   "Deadband R/P", "Deadband yaw", "Deadband thr", "Stick filter", "Calibrate sticks", "Buzzer",
-  "TX batt ratio", "TX cells", "TX warn V/cell",
+  "TX batt ratio", "TX cells", "TX warn V/cell", "Sim mode (BT)",
   "Save & exit", "Exit (no save)"
 };
 static int menuSel = 0, menuTop = 0;
@@ -562,6 +595,7 @@ static void menuValue(int item, char *buf, size_t n) {
     case MI_VRATIO: snprintf(buf, n, "%.2f", c.vRatio100 / 100.0f); break;
     case MI_CELLS:  if (c.cells) snprintf(buf, n, "%uS", c.cells); else snprintf(buf, n, "AUTO"); break;
     case MI_WARN:   snprintf(buf, n, "%.2f", c.warnCell100 / 100.0f); break;
+    case MI_SIM:    snprintf(buf, n, "%s", simMode ? "EXIT" : "START"); break;
     case MI_CALIB: case MI_SAVE: case MI_EXIT: snprintf(buf, n, ">"); break;
   }
 }
@@ -610,6 +644,79 @@ static StickKey keyV, keyH;
 static int      calStep = 0;
 static uint16_t calMin[4], calMax[4];
 
+// ====================== SIM MODE (BLE gamepad) ======================
+// The flag only lives for one boot: choosing SIM MODE saves it and restarts, and that boot clears it again,
+// so the next power-up is always the normal transmitter.
+static BleGamepad *gamepad = nullptr;
+static void restartSim(bool on) {
+  prefs.begin("tx", false); prefs.putUChar("sim", on ? 1 : 0); prefs.end();
+  display.clearDisplay();
+  display.setCursor(10, 28);
+  display.print(on ? "Starting SIM MODE" : "Leaving SIM MODE");
+  display.display();
+  delay(300);
+  ESP.restart();
+}
+static bool takeSimFlag() {
+  prefs.begin("tx", false);
+  bool on = prefs.getUChar("sim", 0);
+  if (on) prefs.putUChar("sim", 0);
+  prefs.end();
+  return on;
+}
+static void simBegin() {
+  gamepad = new BleGamepad("ESP-NOW TX Sim", "Espressif", 100);
+  BleGamepadConfiguration gc;
+  gc.setControllerType(CONTROLLER_TYPE_JOYSTICK);
+  gc.setAutoReport(false);
+  gc.setButtonCount(3);
+  gc.setHatSwitchCount(0);
+  gc.setWhichSpecialButtons(false, false, false, false, false, false, false, false);
+  gc.setWhichAxes(true, true, true, true, true, true, false, false);
+  gc.setWhichSimulationControls(false, false, false, false, false);
+  gc.setAxesMin(0);
+  gc.setAxesMax(32767);
+  gamepad->begin(&gc);
+}
+static int16_t usToAxis(uint16_t us) { return (int16_t)((constrain((int)us, 1000, 2000) - 1000) * 32767L / 1000); }
+static void simTick(uint32_t now) {            // 50 Hz, only when something changed (or every 0.5 s)
+  static uint32_t ms = 0, lastSend = 0;
+  static uint16_t last[NUM_CH];
+  if (!gamepad || now - ms < SEND_PERIOD_MS) return;
+  ms = now;
+  if (!gamepad->isConnected()) return;
+  uint16_t c[NUM_CH];
+  portENTER_CRITICAL(&stMux); for (int i = 0; i < NUM_CH; i++) c[i] = chOut[i]; portEXIT_CRITICAL(&stMux);
+  if (!memcmp(c, last, sizeof c) && now - lastSend < 500) return;
+  memcpy(last, c, sizeof c);
+  lastSend = now;
+  gamepad->setAxes(usToAxis(c[CH_ROLL]), usToAxis(c[CH_PITCH]), usToAxis(c[CH_THR]),
+                   usToAxis(c[CH_AUX1]), usToAxis(c[CH_AUX2]), usToAxis(c[CH_YAW]));
+  if (c[CH_AUX1] > 1500) gamepad->press(BUTTON_1); else gamepad->release(BUTTON_1);
+  if (c[CH_AUX2] > 1250 && c[CH_AUX2] < 1750) gamepad->press(BUTTON_2); else gamepad->release(BUTTON_2);
+  if (c[CH_AUX2] >= 1750) gamepad->press(BUTTON_3); else gamepad->release(BUTTON_3);
+  gamepad->sendReport();
+}
+static void drawSimHeader(bool blink) {
+  bool con = gamepad && gamepad->isConnected();
+  display.fillRect(0, 0, 52, 8, OLED_WHITE);
+  display.setTextColor(OLED_BLACK);
+  display.setCursor(2, 0);
+  display.print("SIM MODE");
+  display.setTextColor(OLED_WHITE);
+  display.setCursor(56, 0);
+  display.print(con ? "BT CONNECTED" : (blink ? "BT PAIRING.." : ""));
+  display.setCursor(2, 8);
+  display.print(armRequest ? "ARM ON" : "arm off");
+#if USE_TX_VBAT
+  float tv;
+  portENTER_CRITICAL(&stMux); tv = txVbat; portEXIT_CRITICAL(&stMux);
+  display.setCursor(68, 8);
+  if (txBattPresent) display.printf("TX %5.2fV", tv);
+  else               display.print("TX  USB");
+#endif
+}
+
 static void enterMenu() {
   forceSafe = true;
   ui = UI_MENU;
@@ -620,6 +727,7 @@ static void enterMenu() {
 static void exitMenu() {
   ui = UI_MAIN;
   armRequest = false;
+  rthRequest = false;
   forceSafe = false;
 }
 
@@ -668,6 +776,8 @@ static void drawMain() {
   bool blink = (millis() / 300) & 1;
 
   display.setTextSize(1);
+  if (simMode) drawSimHeader(blink);
+  else {
   // Header line 1: arm state | mode | link quality
   if (linkOk && t.armed) {
     display.fillRect(0, 0, 34, 8, OLED_WHITE);
@@ -683,7 +793,8 @@ static void drawMain() {
     display.print("SAFE");
   }
   display.setCursor(44, 0);
-  if (linkOk) display.print(t.mode == 3 ? "POS" : (t.mode == 2 ? "ALT" : (t.mode ? "ACRO" : "SELF")));  // mode from the FC
+  if (rthRequest && !(linkOk && t.mode == 4)) { if (blink) display.print("RTH?"); }   // asked, FC not (yet) flying it
+  else if (linkOk) display.print(t.mode == 4 ? "RTH" : t.mode == 3 ? "POS" : (t.mode == 2 ? "ALT" : (t.mode ? "ACRO" : "SELF")));  // mode from the FC
   if (linkOk) {
     // signal of the WEAKER direction (FC hears TX / TX hears FC) and the lower link quality of the two
     int rFc = t.rssi, rTx = (int)lroundf(txRssiF);
@@ -699,7 +810,31 @@ static void drawMain() {
     display.print("NO LINK");
   }
 
-  // Header line 2: FC battery | TX battery (each blinks inverted when LOW)
+  // Header line 2: FC battery | TX battery (each blinks inverted when LOW); with GPS data also sats + home distance
+  GpsTelemetry g;
+  uint32_t lg;
+  portENTER_CRITICAL(&stMux); g = gtel; lg = lastGpsMs; portEXIT_CRITICAL(&stMux);
+  if (lg && millis() - lg < 1000) {
+    bool fcPresent = linkOk && (t.battFlags & 1), fcLow = t.battFlags & 2;
+    if (fcPresent && fcLow && blink) { display.fillRect(0, 8, 40, 8, OLED_WHITE); display.setTextColor(OLED_BLACK); }
+    display.setCursor(2, 8);
+    if (fcPresent) display.printf("FC%4.1f", t.vbat100 / 100.0f);
+    else           display.print("FC --");
+    display.setTextColor(OLED_WHITE);
+    display.setCursor(44, 8);
+    if (!(g.flags & 64))     display.print("NO GPS");
+    else if (g.flags & 1)    display.printf("%2us%4um", g.sats, (unsigned)min<uint16_t>(g.distHome, 9999));
+    else                     display.printf("%2us WAIT", g.sats);
+#if USE_TX_VBAT
+    float tv;
+    portENTER_CRITICAL(&stMux); tv = txVbat; portEXIT_CRITICAL(&stMux);
+    if (txBattPresent && txBattLow && blink) { display.fillRect(96, 8, 32, 8, OLED_WHITE); display.setTextColor(OLED_BLACK); }
+    display.setCursor(98, 8);
+    if (txBattPresent) display.printf("T%3.1f", tv);
+    else               display.print("TUSB");
+    display.setTextColor(OLED_WHITE);
+#endif
+  } else
   {
     bool fcPresent = linkOk && (t.battFlags & 1), fcLow = t.battFlags & 2;
     if (fcPresent && fcLow && blink) { display.fillRect(0, 8, 60, 8, OLED_WHITE); display.setTextColor(OLED_BLACK); }
@@ -717,6 +852,7 @@ static void drawMain() {
     else               display.print("TX  USB");
     display.setTextColor(OLED_WHITE);
 #endif
+  }
   }
   display.drawFastHLine(0, 17, 128, OLED_WHITE);
 
@@ -859,11 +995,12 @@ void setup() {
   display.print("ESP-NOW");
   display.setTextSize(1);
   display.setCursor(10, 34);
-  display.print("6CH Transmitter");
+  simMode = takeSimFlag();
+  display.print(simMode ? "SIM MODE (BT)" : "6CH Transmitter");
   display.display();
 
   loadSettings();
-  radioBegin();
+  if (simMode) simBegin(); else radioBegin();
   xTaskCreate(radioTask, "radio", 4096, nullptr, 5, nullptr);
   delay(800);
 
@@ -893,6 +1030,7 @@ void loop() {
   BtnEvent btn = pollButton();
   txBatteryTick(now);
   pollSwitch();
+  if (simMode) simTick(now);
 
   // Link quality: telemetry is sent at 20 Hz
   static uint32_t lqMs = 0;
@@ -929,13 +1067,17 @@ void loop() {
 
   switch (ui) {
     case UI_MAIN:
-      if (btn == BTN_SHORT) {
-        if (armRequest)          { armRequest = false; showMsg("DISARMED"); }
+      if (btn == BTN_SHORT || (btn == BTN_LONG_UP && armRequest)) {   // armed: any press under 2 s disarms
+        if (armRequest)          { armRequest = false; rthRequest = false; showMsg("DISARMED"); }
         else if (thrPos > 0.05f) showMsg("LOWER THROTTLE!");
         else                     armRequest = true;
       } else if (btn == BTN_LONG) {
-        if (armRequest) showMsg("DISARM FIRST");
+        if (armRequest) showMsg("KEEP HOLDING: RTH");
         else            enterMenu();
+      } else if (btn == BTN_HOLD2 && armRequest) {                    // 2 s: return to home on / off
+        rthRequest = !rthRequest;
+        showMsg(rthRequest ? "RETURN TO HOME" : "RTH CANCELLED", 2000);
+        buzzTestUntil = millis() + (rthRequest ? 600 : 200);
       }
       break;
 
@@ -948,6 +1090,7 @@ void loop() {
       if (btn == BTN_SHORT) {
         switch (menuSel) {
           case MI_CALIB: startCalib(); break;
+          case MI_SIM:   saveSettings(); restartSim(!simMode); break;
           case MI_SAVE:  saveSettings(); showMsg("SAVED"); exitMenu(); break;
           case MI_EXIT:  loadSettings(); exitMenu(); break;
           default:       menuAdjust(menuSel, 1); break;
