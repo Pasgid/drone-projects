@@ -1,0 +1,4 @@
+SimpleFC Brushed shield drill list
+  1.0 mm : 39 holes
+  1.3 mm : 16 holes
+Board 62.5 x 38.6 mm, single-sided, SMD parts on the copper side.
