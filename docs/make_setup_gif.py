@@ -2,13 +2,17 @@
 Each step is an HTML card (picture + a few lines), screenshotted with headless Edge/Chrome, then joined with Pillow.
 Run:  python docs/make_setup_gif.py            (all guides)
       python docs/make_setup_gif.py brushed    (one guide: brushed, simple, tx2, oldfc)
-Needs:  pip install pillow"""
+Also writes a vertical 1080x1920 MP4 of each guide (docs/video/, ready for TikTok / Reels / Shorts) with LINK at the bottom.
+Needs:  pip install pillow imageio-ffmpeg"""
 import os, re, sys, subprocess, tempfile, html
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMG = os.path.join(ROOT, "docs", "img")
 W, H = 1000, 720
+VID = os.path.join(ROOT, "docs", "video")
+LINK = "github.com/Pasgid/drone-projects"            # shown at the bottom of every video frame
+VW, VH, FPS = 1080, 1920, 30
 BROWSERS = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Google\Chrome\Application\chrome.exe"]
 
@@ -219,6 +223,43 @@ def build(key):
     out = os.path.join(IMG, out_name)
     pal[0].save(out, save_all=True, append_images=pal[1:], duration=durations, loop=0, optimize=True)
     print("wrote %s  %.0f kB  %d frames  (pngs in %s)" % (out, os.path.getsize(out) / 1024, len(frames), tmp))
+    video(key, steps, frames, durations, tmp)
+
+def font(size, bold=True):
+    for n in (("segoeuib.ttf" if bold else "segoeui.ttf"), "arialbd.ttf", "arial.ttf"):
+        try: return ImageFont.truetype(os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", n), size)
+        except OSError: pass
+    return ImageFont.load_default()
+
+def centre(d, y, s, f, fill):
+    w = d.textlength(s, font=f); d.text(((VW - w) / 2, y), s, font=f, fill=fill)
+
+def video(key, steps, frames, durations, tmp):
+    """Vertical MP4: the guide's title on top, the step card in the middle, the link at the bottom."""
+    import imageio_ffmpeg
+    os.makedirs(VID, exist_ok=True)
+    title = steps[0][0].replace(" setup", "")
+    lst = os.path.join(tmp, "list.txt")
+    with open(lst, "w", encoding="utf-8") as L:
+        for i, (fr, ms) in enumerate(zip(frames, durations)):
+            v = Image.new("RGB", (VW, VH), "#0f1720"); d = ImageDraw.Draw(v)
+            centre(d, 170, "ESP32 DIY DRONE", font(44), "#e0620d")
+            centre(d, 235, title, font(58), "#ffffff")
+            centre(d, 320, "setup guide  -  step %d of %d" % (i + 1, len(frames)), font(36, False), "#9fb3c8")
+            card = fr.resize((VW, round(H * VW / W)), Image.LANCZOS)
+            v.paste(card, (0, (VH - card.height) // 2 + 20))
+            d.rounded_rectangle((90, 1560, VW - 90, 1680), 30, fill="#1d2b3a")
+            centre(d, 1576, "Wiring + code:", font(32, False), "#9fb3c8")
+            centre(d, 1614, LINK, font(42), "#7ee787")
+            p = os.path.join(tmp, "v%02d.png" % i); v.save(p)
+            L.write("file '%s'\nduration %.3f\n" % (p.replace("\\", "/"), ms / 1000))
+        L.write("file '%s'\n" % p.replace("\\", "/"))       # concat needs the last frame twice
+    out = os.path.join(VID, os.path.splitext(GUIDES[key][0])[0].replace("setup_guide_", "setup_") + ".mp4")
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst,
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
+                    "-vf", "fps=%d,format=yuv420p" % FPS, "-c:v", "libx264", "-preset", "slow", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", out], check=True)
+    print("wrote %s  %.1f MB  %.0f s" % (out, os.path.getsize(out) / 1e6, sum(durations) / 1000))
 
 for k in (sys.argv[1:] or GUIDES):
     build(k)

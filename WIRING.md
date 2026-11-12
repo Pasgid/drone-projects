@@ -9,6 +9,9 @@ One page per board: a pinout picture, then the same pins as a table. The pin num
 - Transmitter2: [setup_guide_transmitter2.gif](docs/img/setup_guide_transmitter2.gif)
 - C3 Zero FC (FlightController): [setup_guide_c3zero_fc.gif](docs/img/setup_guide_c3zero_fc.gif)
 
+Videos (vertical 1080x1920 MP4 for TikTok / Reels / Shorts, with the repo link at the bottom). Open one and press the download button:
+[SimpleFC_Brushed](docs/video/setup_brushed.mp4) · [SimpleTX + SimpleFC](docs/video/setup_simpletx_simplefc.mp4) · [Transmitter2](docs/video/setup_transmitter2.mp4) · [C3 Zero FC](docs/video/setup_c3zero_fc.mp4)
+
 ### SimpleFC_Brushed
 
 ![SimpleFC_Brushed setup guide](docs/img/setup_guide_brushed.gif)
