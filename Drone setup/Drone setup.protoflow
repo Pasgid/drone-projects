@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "documentType": "protoflow_project",
+  "name": "Drone setup",
+  "projectFile": "Drone setup.kicad_pro",
+  "description": "Guided LED circuit tutorial for learning ProtoFlow basics."
+}

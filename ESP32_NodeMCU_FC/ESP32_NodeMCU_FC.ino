@@ -161,7 +161,8 @@
   #include <WiFi.h>
   #include <esp_now.h>
   #include <esp_wifi.h>
-  #define PKT_MAGIC   0xC3F1
+  #define PKT_MAGIC   0xC3F1   // control packets from SimpleTX
+  #define TLM_MAGIC   0xC3F2   // telemetry in SimpleFC's layout (SimpleTX reads 0xC3F1 telemetry as the old C3 FC's layout)
   #define BIND_ID     42
   #define WIFI_CH     13       // away from phone hotspots / routers (1, 6, 11). MUST match the TX
 #endif
@@ -1946,7 +1947,7 @@ void telemetryTick(uint32_t ms) {
   last = ms;
   TelemetryPacket t;
   memset(&t, 0, sizeof t);
-  t.magic = PKT_MAGIC;
+  t.magic = TLM_MAGIC;
   t.bindId = BIND_ID;
   t.armed = armed;
   t.mode = (mode == MODE_ACRO) ? 1 : 0;

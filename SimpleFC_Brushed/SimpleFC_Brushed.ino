@@ -1,8 +1,8 @@
 /*
- * SimpleFC BRUSHED - copy of SimpleFC for a 1S brushed micro quad (8520 / 716 motors) on an ESP32-C3 SuperMini:
- *   SELF-LEVEL + barometer ALT HOLD. MPU6050 + BMP280 + 128x64 I2C OLED, ESP-NOW link to SimpleTX.
+ * SimpleFC BRUSHED - copy of SimpleFC for a 2S brushed micro quad (820 coreless, 7.4 V motors) on an ESP32-C3 SuperMini:
+ *   SELF-LEVEL + barometer ALT HOLD. MPU6050 + barometer (BMP280 or GY-63 MS5611, auto-detected), no OLED, ESP-NOW link to SimpleTX.
  *   Differences from SimpleFC: motors are driven DIRECTLY with 20 kHz PWM duty (0-100 %) through one logic-level
- *   N-MOSFET per motor - no ESCs, no ESC calibration. 1S battery defaults. Settings in NVS "sfcb" (own namespace,
+ *   N-MOSFET per motor - no ESCs, no ESC calibration. 2S battery defaults. Settings in NVS "sfcb" (own namespace,
  *   never imports the brushless quad's tuning).
  *
  * ---------------- MOTOR DRIVER (one per motor) ----------------
@@ -11,17 +11,16 @@
  *   source -> GND,  drain -> motor (-),  motor (+) -> battery (+)
  *   Schottky diode (SS14 / 1N5819) across the motor: cathode to battery (+), anode to the drain (flyback)
  *   Optional 100 nF ceramic across each motor's terminals (brush noise).
- *   Power: 470-1000 uF low-ESR on the battery, close to the MOSFETs. The C3 + sensors need a STABLE 3.3 V: 1S sags
- *   to ~3.3 V under load, so feed the SuperMini's 5 V pin from a small 1S->5 V boost (with 100 uF on its output), or
- *   use a low-dropout 3.3 V regulator (e.g. ME6211/RT9013) with a big capacitor - otherwise brown-outs.
+ *   Power: 470-1000 uF low-ESR, 16 V or more, on the battery, close to the MOSFETs. Feed the SuperMini's 5 V pin from a
+ *   2S->5 V BUCK (set to 5.0 V before connecting, 100 uF on its output). NEVER put 2S on the 5 V pin (about 6 V maximum).
  *
  * ---------------- WIRING (ESP32-C3 Zero) ----------------
- *   I2C SDA GPIO6, SCL GPIO7 (400 kHz): MPU6050 0x68, BMP280 0x76/0x77, OLED 0x3C (SH1106, or SSD1306 below)
+ *   I2C SDA GPIO6, SCL GPIO7 (400 kHz): MPU6050 0x68, BMP280 or GY-63 (MS5611) 0x76/0x77
  *   Motors (Betaflight order, props in, top view, front up):   M4 FL (CW)   M2 FR (CCW)
  *                                                              M3 RL (CCW)  M1 RR (CW)
  *     M1 GPIO0, M2 GPIO1, M3 GPIO3, M4 GPIO5   (20 kHz PWM to the MOSFET gates; 1000 us = off, 2000 us = 100 %)
- *   Battery divider pack+ --100k-- GPIO4 --100k-- GND, 100 nF GPIO4-GND (ratio 2.0 for 1S, set vRatio)
- *   Active buzzer: GPIO20 -> 1k -> NPN base, buzzer between collector and +5 V
+ *   Battery divider pack+ --100k-- GPIO4 --33k-- GND, 100 nF GPIO4-GND (ratio 4.03 for 2S, set vRatio)
+ *   Passive buzzer (2.7 kHz tone): GPIO20 -> 100R -> buzzer -> GND. Louder: GPIO20 -> 1k -> NPN base, buzzer collector to +3V3/5V
  *   DJI O4 air unit (OSD, MSP DisplayPort 115200): FC GPIO21 -> air unit RX, FC GPIO10 <- air unit TX, GND.
  *     Power the air unit from the battery. OSD on/off and canvas size: SETUP > DJI OSD (default 53 x 20).
  *   GPIO2 is not used (shorted on the original board). GPIO10 = on-board RGB LED (not used).
@@ -35,7 +34,7 @@
  *   ALT HOLD engages only on a CHANGE to ALT (a MODE press; arming with ALT already selected counts as a change):
  *     in the air  -> holds the current height
  *     on the ground -> motors idle until the throttle goes above the hover point, then it climbs
- *   Throttle in ALT HOLD: within +-deadband of the learned HOVER POINT = hold, above = climb (max 1 m/s),
+ *   Throttle in ALT HOLD: from HOVER POINT to mid stick (setting Stick mid), +-deadband = hold, above = climb (max 1 m/s),
  *   below = descend (max 0.7 m/s). Stick fully down on the ground for 0.8 s = LANDED (motors idle).
  *   Hover throttle is learned while hovering (SELF and ALT HOLD) and saved at disarm.
  *
@@ -71,12 +70,20 @@
  *     D            dump the last flight (CSV) S            status line on/off
  *   Settings can only be changed while disarmed.
  *
- * Libraries: U8g2 (oliver). Board: ESP32C3 Dev Module, USB CDC On Boot: Enabled. Core esp32 3.x.
+ * ---------------- CONFIGURATION: USB SERIAL 115200 (no OLED on this build) ----------------
+ *   help    command list                  ?         all settings, by group       name=value  change one, then: save
+ *   cal     level calibration (flat!)     m1..m4, mall  spin a motor 2 s (PROPS OFF), stop = stop at once
+ *   st      one status line               S         status line on/off           stats       last flight, stop reason
+ *   D       dump the last flight (CSV)    defaults  factory settings
+ * Libraries: none besides the core (U8g2 only with USE_OLED 1). Board: ESP32C3 Dev Module, USB CDC On Boot: Enabled. Core esp32 3.x.
  * !!! FIRST TESTS WITH PROPS OFF: check the sensor directions (OLED / serial) and the motor reaction.
  */
 
 #include <Wire.h>
+#define USE_OLED 0                // no display on the micro (weight): configured over USB serial. 1 = 0.91 in SSD1306 + stick menu
+#if USE_OLED
 #include <U8g2lib.h>
+#endif
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -95,7 +102,7 @@
 #define PIN_OSD_RX 10             // DJI O4 air unit TX  (UART1 RX)
 #define PIN_BTN   9               // BOOT button (not used for flying; OLED page)
 const uint8_t MOTOR_PIN[4] = {0, 1, 3, 5};   // M1 RR, M2 FR, M3 RL, M4 FL (GPIO5: not a strapping pin, no LED)
-//#define OLED_IS_SSD1306         // uncomment for an SSD1306 OLED (default SH1106)
+// OLED: 0.91 inch SSD1306, 128 x 32 (four rows of 5x8 text; all pages below are laid out for this size)
 
 #define LOOP_HZ   400
 #define LOOP_US   (1000000UL / LOOP_HZ)
@@ -169,7 +176,7 @@ struct Params {
   float gRollP, gRollI, gRollD, gPitchP, gPitchI, gPitchD, gYawP, gYawI;
   float gyroLpf, dtermLpf, notchHz, notchQ, accLpfHz, lvDLpfHz;
   float rcSmoothHz, itermRelax, antiGrav;
-  float altP, velP, velI, maxClimb, maxDesc, deadband, minThr, hover, ceilingM;
+  float altP, velP, velI, maxClimb, maxDesc, deadband, minThr, hover, ceilingM, thrMid, estTau;
   float osdOn, osdCols, osdRows;
 };
 struct ParamDef { const char *name; const char *label; float Params::*m; float def, mn, mx, step; uint8_t dec, grp; };
@@ -221,6 +228,7 @@ struct __attribute__((packed)) RecSample {   // flight recorder, 50 Hz
   uint16_t m[4];                   // us
   uint16_t vbat100, ctrlUs;
   int16_t  alt100, altT100;        // estimate / hold target, cm
+  int16_t  accUp100, accCorr100, altI10;   // vertical acceleration and its offset (cm/s^2), VEL I correction (us x10)
   int16_t  vel100;                 // vertical speed, cm/s
   uint8_t  flags;                  // bit0 mode ALT, bit1 alt valid, bit2 landed, bit3 failsafe landing
   uint8_t  vib10;
@@ -274,16 +282,18 @@ const ParamDef PARAMS[] = {
   {"minThr",       "Min throttle",  &Params::minThr,       1100,  1050, 1500, 10,    0, G_ALT},    // lowest in the air
   {"hover",        "Hover thr",     &Params::hover,        1500,  1100, 1800, 5,     0, G_ALT},     // brushed micros hover near 50 %    // learned (ref 3.85 V/cell)
   {"ceilingM",     "Ceiling m",     &Params::ceilingM,     0,     0, 100,     0.5f,  1, G_ALT},    // above the arming point, 0 = off
+  {"thrMid",       "Stick mid 0=hvr", &Params::thrMid,     1350,  0, 1800,    10,    0, G_ALT},    // what the TX sends at mid stick (SimpleTX Thr centre), also holds
+  {"estTau",       "Est blend s",   &Params::estTau,       BARO_TAU, 0.5f, 5, 0.1f,  1, G_ALT},    // shorter trusts the baro more for vertical speed
   {"rollTrim",     "Roll trim",     &Params::rollTrim,     0.4f,   -TRIM_LIMIT, TRIM_LIMIT, 0.1f, 1, G_TRIM},  // deg
   {"pitchTrim",    "Pitch trim",    &Params::pitchTrim,    -3.56f,   -TRIM_LIMIT, TRIM_LIMIT, 0.1f, 1, G_TRIM},
   {"rollSensRev",  "Roll sens rev", &Params::rollSensRev,  0,     0, 1,       1,     0, G_TRIM},   // 1 = reversed
   {"pitchSensRev", "Pitch sns rev", &Params::pitchSensRev, 0,     0, 1,       1,     0, G_TRIM},
   {"propsIn",      "Props in",      &Params::propsIn,      1,     0, 1,       1,     0, G_TRIM},   // 1 = props in (M1 CW)
   {"motorIdle",    "Motor idle us", &Params::motorIdle,    1050,  1000, 1300, 5,     0, G_TRIM},     // brushed: ~5 % duty spins slowly
-  {"vRatio",       "Volt ratio",    &Params::vRatio,       2.0f,  1, 40,      0.05f, 2, G_BATT},   // (R1+R2)/R2, 100k/100k
-  {"cells",        "Cells (0=auto)", &Params::cells,       1,     0, 8,       1,     0, G_BATT},
+  {"vRatio",       "Volt ratio",    &Params::vRatio,       4.03f, 1, 40,      0.01f, 2, G_BATT},   // (R1+R2)/R2, 100k/33k: 8.4 V gives 2.08 V at the pin
+  {"cells",        "Cells (0=auto)", &Params::cells,       2,     0, 8,       1,     0, G_BATT},
   {"cellWarn",     "Warn V/cell",   &Params::cellWarn,     3.5f,  3.0f, 4.0f, 0.05f, 2, G_BATT},
-  {"osdOn",        "OSD on",        &Params::osdOn,        1,     0, 1,       1,     0, G_OSD},    // MSP DisplayPort to DJI O4
+  {"osdOn",        "OSD on",        &Params::osdOn,        0,     0, 1,       1,     0, G_OSD},    // MSP DisplayPort to DJI O4
   {"osdCols",      "Canvas cols",   &Params::osdCols,      53,    30, 60,     1,     0, G_OSD},    // set by the air unit if it says
   {"osdRows",      "Canvas rows",   &Params::osdRows,      20,    16, 22,     1,     0, G_OSD},
 };const int N_PARAMS = sizeof(PARAMS) / sizeof(PARAMS[0]);
@@ -386,11 +396,9 @@ void saveTrims() {
 }
 
 // ======================= STATE =======================
+#if USE_OLED
 U8G2 *oled;
-#if defined(OLED_IS_SSD1306)
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oledDev(U8G2_R0, U8X8_PIN_NONE);
-#else
-U8G2_SH1106_128X64_NONAME_F_HW_I2C  oledDev(U8G2_R0, U8X8_PIN_NONE);
+U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C oledDev(U8G2_R0, U8X8_PIN_NONE);
 #endif
 
 bool armed = false, armSeenLow = false, inFlight = false, liftedOff = false;
@@ -426,12 +434,13 @@ float baroPa = 0, baroGroundPa = 0, baroAlt = 0; bool baroNew = false;
 float altEst = 0, velEst = 0, accCorr = 0, accUp = 0; bool altValid = false;
 bool altHold = false, altLanded = false;
 uint32_t altLandSince = 0, altStuckSince = 0;
+float altZoneLo = 1350, altZoneHi = 1550;   // throttle stick inside this = hold height
 float altTarget = 0, altInteg = 0, altRefThr = 1450, altHoverBase = 1450, altThrRef = 1450, altThrOut = 1000;
 uint32_t exitBlendStart = 0; float exitBlendFrom = 1000;
 
 char msgText[24] = ""; uint32_t msgUntil = 0;
 uint16_t loopUs = 0, loopMaxUs = 0, ctrlUs = 0, ctrlMaxUs = 0;
-bool statusPrint = true;
+bool statusPrint = false;           // S toggles it: quiet by default, this port is the configuration console
 bool levelCalRunning = false, levelCalRequest = false;
 enum { PG_STATUS, PG_SENSORS, PG_STATS, PG_TREND, PG_SETUP, PG_COUNT };   // OLED pages (BOOT button; SETUP last)
 uint8_t page = PG_STATUS;
@@ -439,6 +448,9 @@ uint8_t page = PG_STATUS;
 // ======================= HELPERS =======================
 void setMsgFor(const char *s, uint32_t ms) {
   strncpy(msgText, s, sizeof msgText - 1); msgText[sizeof msgText - 1] = 0; msgUntil = millis() + ms;
+#if !USE_OLED
+  Serial.println(msgText);          // no display: messages go to the console
+#endif
 }
 void setMsg(const char *s) { setMsgFor(s, 3000); }
 uint8_t crc8(const uint8_t *d, size_t n) {
@@ -464,10 +476,17 @@ bool i2cWrite8(uint8_t addr, uint8_t reg, uint8_t v) {
   Wire.beginTransmission(addr); Wire.write(reg); Wire.write(v); return Wire.endTransmission() == 0;
 }
 
-// ======================= BUZZER (active, on/off) =======================
+// ======================= BUZZER (passive: driven with a tone) =======================
 // one-shot patterns: bit i = 100 ms slot i
 uint32_t evBits = 0, evStart = 0; uint8_t evLen = 0;
 bool lostModel = false; uint32_t lostSince = 0;
+#define BUZZ_HZ 2700                // most small passive buzzers are loudest around 2-4 kHz
+void buzz(bool on) {
+  static int8_t st = -1;            // only touch the LEDC when it changes
+  if (st == (on ? 1 : 0)) return;
+  st = on ? 1 : 0;
+  ledcWrite(PIN_BUZZ, on ? 128 : 0);   // 50 % square wave = tone
+}
 void beep(uint32_t bits, uint8_t len) { evBits = bits; evLen = len; evStart = millis(); }
 #define BEEP_SHORT  beep(0x1, 2)
 #define BEEP_LONG   beep(0x3, 3)
@@ -484,7 +503,7 @@ void buzzerTick(uint32_t ms) {
   else if (evLen && ms - evStart < evLen * 100UL)      on = patternOn(evBits, evLen, ms - evStart);
   else if (lostModel)                                  on = patternOn(0x7, 6, ms);
   else if (battLow)                                    on = patternOn(0x5, 20, ms);
-  digitalWrite(PIN_BUZZ, on ? HIGH : LOW);
+  buzz(on);
 }
 
 // ======================= MOTORS =======================
@@ -646,13 +665,88 @@ float thrToRef(float raw)   { return 1000 + (raw - 1000) / batComp(); }
 float thrFromRef(float ref) { return 1000 + (ref - 1000) * batComp(); }
 float hoverPoint() { return constrain(thrFromRef(P.hover), 1200.0f, 1750.0f); }   // stick that hovers NOW
 
-// ======================= BMP280 (own driver, never blocks) =======================
+// ======================= BAROMETER: BMP280 or MS5611 (GY-63), auto-detected. Own drivers, never block =======================
+// MS5611 (GY-63). I2C needs PS high; CSB low = address 0x77, CSB high = 0x76. It has no ID register: it is recognised by
+// answering at the address and by its PROM. Each reading takes two conversions (temperature, pressure, up to 9.04 ms each
+// at OSR 4096), so baroTick steps it every 20 ms: one pressure value per 40 ms, the same 25 Hz as the BMP280.
+bool baroIsMs = false;
+uint16_t msC[8];
+
+bool msCmd(uint8_t c) { Wire.beginTransmission(baroAddr); Wire.write(c); return Wire.endTransmission() == 0; }
+
+bool msRead(uint8_t reg, uint8_t *buf, uint8_t n) {   // this chip wants a STOP between the command and the read
+  if (!msCmd(reg)) return false;
+  if (Wire.requestFrom(baroAddr, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+
+bool msCrcOk() {                    // Measurement Specialties AN520: CRC-4 over the 8 PROM words
+  uint16_t rem = 0;
+  for (int i = 0; i < 16; i++) {
+    uint16_t w = msC[i >> 1];
+    if (i >= 14) w &= 0xFF00;       // the CRC itself (low byte of word 7) counts as 0
+    rem ^= (i & 1) ? (w & 0xFF) : (w >> 8);
+    for (int b = 0; b < 8; b++) rem = (rem & 0x8000) ? (uint16_t)((rem << 1) ^ 0x3000) : (uint16_t)(rem << 1);
+  }
+  return ((rem >> 12) & 0xF) == (msC[7] & 0xF);
+}
+
+bool msInit() {
+  for (uint8_t a : {(uint8_t)0x77, (uint8_t)0x76}) {
+    baroAddr = a;
+    if (!msCmd(0x1E)) continue;     // reset; no ACK = nothing at this address
+    delay(4);
+    bool ok = true;
+    for (int i = 0; i < 8 && ok; i++) {
+      uint8_t b[2];
+      ok = msRead(0xA0 + 2 * i, b, 2);
+      if (ok) msC[i] = (b[0] << 8) | b[1];
+    }
+    for (int i = 1; i <= 6 && ok; i++) if (msC[i] == 0 || msC[i] == 0xFFFF) ok = false;
+    if (!ok) continue;
+    if (!msCrcOk()) Serial.println("MS5611: PROM CRC mismatch (clone?), using it anyway");
+    baroIsMs = true;
+    Serial.printf("MS5611 (GY-63) at 0x%02X\n", a);
+    return true;
+  }
+  baroAddr = 0;
+  Serial.println("Barometer not found (BMP280 / MS5611)");
+  return false;
+}
+
+// one step per call; true = a new pressure in baroPa. A failed read restarts the cycle.
+bool msStep() {
+  static uint8_t st = 0;
+  static uint32_t d2 = 0;
+  uint8_t b[3];
+  if (st == 0) { if (msCmd(0x58)) st = 1; return false; }                       // start temperature, OSR 4096
+  if (!msRead(0x00, b, 3)) { st = 0; return false; }
+  uint32_t adc = ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
+  if (adc == 0) { st = 0; return false; }                                       // read too early or chip busy
+  if (st == 1) { d2 = adc; st = msCmd(0x48) ? 2 : 0; return false; }            // start pressure, OSR 4096
+  uint32_t d1 = adc;
+  st = msCmd(0x58) ? 1 : 0;                                                     // next temperature
+  int32_t dT = (int32_t)d2 - ((int32_t)msC[5] << 8);
+  int32_t temp = 2000 + (int32_t)(((int64_t)dT * msC[6]) >> 23);
+  int64_t off = ((int64_t)msC[2] << 16) + (((int64_t)msC[4] * dT) >> 7);
+  int64_t sens = ((int64_t)msC[1] << 15) + (((int64_t)msC[3] * dT) >> 8);
+  if (temp < 2000) {                                                            // second-order compensation (datasheet)
+    int64_t tt = (int64_t)(temp - 2000) * (temp - 2000);
+    off -= 5 * tt / 2; sens -= 5 * tt / 4;
+    if (temp < -1500) { int64_t t2 = (int64_t)(temp + 1500) * (temp + 1500); off -= 7 * t2; sens -= 11 * t2 / 2; }
+  }
+  int64_t p = ((((int64_t)d1 * sens) >> 21) - off) >> 15;                       // 0.01 mbar = Pa
+  baroPa = (float)p;
+  return baroPa > 30000 && baroPa < 120000;
+}
+
 bool baroInit() {
   for (uint8_t a : {(uint8_t)0x76, (uint8_t)0x77}) {
     uint8_t id = 0;
     if (i2cRead(a, 0xD0, &id, 1) && (id == 0x58 || id == 0x60)) { baroAddr = a; break; }
   }
-  if (!baroAddr) { Serial.println("BMP280 not found"); return false; }
+  if (!baroAddr) return msInit();
   uint8_t c[24];
   if (!i2cRead(baroAddr, 0x88, c, 24)) return false;
   bT1 = c[0] | (c[1] << 8);   bT2 = c[2] | (c[3] << 8);   bT3 = c[4] | (c[5] << 8);
@@ -686,9 +780,9 @@ bool baroRead() {                   // Bosch float compensation
 
 void baroTick(uint32_t ms) {
   static uint32_t last = 0;
-  if (!baroOK || ms - last < BARO_PERIOD_MS) return;
+  if (!baroOK || ms - last < (baroIsMs ? BARO_PERIOD_MS / 2u : (uint32_t)BARO_PERIOD_MS)) return;
   last = ms;
-  if (!baroRead()) return;
+  if (!(baroIsMs ? msStep() : baroRead())) return;
   if (baroGroundPa <= 0) { baroGroundPa = baroPa; baroAlt = 0; }
   float a = 44330.0f * (1 - powf(baroPa / baroGroundPa, 0.190295f));
   baroAlt += (1 - expf(-2 * PI * BARO_LPF_HZ * BARO_PERIOD_MS * 1e-3f)) * (a - baroAlt);
@@ -707,7 +801,7 @@ void altEstTick(float dt) {
   // disarmed and still: the vertical speed is 0 -> learn the accelerometer bias, pin the estimate to the baro
   bool still = !armed && imuStill();
   if (still) { accCorr += (-accUp - accCorr) * dt; velEst = 0; altEst = baroAlt; return; }
-  const float k1 = 3 / BARO_TAU, k2 = 3 / (BARO_TAU * BARO_TAU), k3 = 1 / (BARO_TAU * BARO_TAU * BARO_TAU);
+  const float tau = P.estTau, k1 = 3 / tau, k2 = 3 / (tau * tau), k3 = 1 / (tau * tau * tau);
   float err = baroAlt - altEst;
   accCorr = constrain(accCorr + err * k3 * dt, -3.0f, 3.0f);
   velEst = constrain(velEst + (accUp + accCorr) * dt + err * k2 * dt, -10.0f, 10.0f);
@@ -727,6 +821,17 @@ void altHoldStart(bool ground) {
   altTarget = altEst;
   altRefThr = hoverPoint();                          // hold zone = around the hover throttle
   altHoverBase = constrain(P.hover, 1150.0f, 1750.0f);   // feed-forward (reference)
+  // Switched on in the air while (nearly) steady: the throttle the pilot is holding right now IS the hover throttle.
+  // Use it for the hold zone and the feed-forward, so no stick change is needed and a stale learned hover value
+  // cannot make it sink first and then overshoot (seen: rising past the target, then dropping almost to the ground).
+  if (!ground && fabsf(velEst) < 0.5f && ch[RX_THR] > P.minThr) {
+    altRefThr = ch[RX_THR];
+    altHoverBase = constrain(thrToRef(ch[RX_THR]), 1150.0f, 1750.0f);
+  }
+  // hold zone = from the lower to the higher of the hover point and mid stick, +- deadband
+  float mid = P.thrMid >= 1100 ? P.thrMid : altRefThr;
+  altZoneLo = min(altRefThr, mid) - P.deadband;
+  altZoneHi = max(altRefThr, mid) + P.deadband;
   altInteg = 0;
   altThrOut = ground ? 1000 : ch[RX_THR];
   setMsg(ground ? "ALT: STICK UP=TAKEOFF" : "ALT HOLD ON");
@@ -747,7 +852,7 @@ float altHoldThrottle(float dt) {
   uint32_t ms = millis();
   float thr = ch[RX_THR];
   if (altLanded) {
-    if (thr > altRefThr + P.deadband) {             // take off
+    if (thr > altZoneHi) {                          // take off
       altLanded = false; altTarget = altEst; altInteg = 0; altLandSince = altStuckSince = 0;
       setMsg("TAKEOFF");
     } else { altThrOut = 1000; return 1000; }       // idle, no stabilisation
@@ -772,9 +877,9 @@ float altHoldThrottle(float dt) {
       return 1000;
     }
   }
-  float d = thr - altRefThr, db = P.deadband, climb = 0;
-  if (d > db)       climb =  constrain((d - db) / 300.0f, 0.0f, 1.0f) * P.maxClimb;
-  else if (d < -db) climb = -constrain((-d - db) / 300.0f, 0.0f, 1.0f) * P.maxDesc;
+  float climb = 0;
+  if (thr > altZoneHi)      climb =  constrain((thr - altZoneHi) / 300.0f, 0.0f, 1.0f) * P.maxClimb;
+  else if (thr < altZoneLo) climb = -constrain((altZoneLo - thr) / 300.0f, 0.0f, 1.0f) * P.maxDesc;
   // the stick moves the TARGET at the commanded rate (kept within 0.5 m of the estimate)
   if (climb != 0) altTarget = constrain(altTarget + climb * dt, altEst - 0.5f, altEst + 0.5f);
   float velTgt = constrain(climb + P.altP * (altTarget - altEst), -P.maxDesc, P.maxClimb);
@@ -809,8 +914,16 @@ void hoverLearn(float dt) {
   if (!armed || !altValid || fabsf(roll) > 10 || fabsf(pitch) > 10) return;
   if (!altHold && inFlight && liftedOff && fabsf(velEst) < 0.3f && ch[RX_THR] > 1150)
     P.hover += (thrToRef(ch[RX_THR]) - P.hover) * dt / 4;
-  if (altHold && !altLanded && fabsf(ch[RX_THR] - altRefThr) <= P.deadband && fabsf(velEst) < 0.15f && altThrOut > 1150)
-    P.hover += (altThrRef - P.hover) * dt / 8;
+  // in ALT HOLD: whenever it is steady at its target (whatever the stick does), the throttle it needs is the hover
+  // throttle. The feed-forward follows it and the integrator gives up the same amount (no bump), so the next hold
+  // starts with the right value instead of winding the integrator up again.
+  if (altHold && !altLanded && fabsf(velEst) < 0.15f && fabsf(altTarget - altEst) < 0.25f && altThrOut > P.minThr + 20) {
+    float d = (altThrRef - P.hover) * dt / 6;
+    P.hover += d;
+    float nb = constrain(P.hover, 1150.0f, 1750.0f);
+    altInteg = constrain(altInteg - (nb - altHoverBase), -250.0f, 250.0f);
+    altHoverBase = nb;
+  }
   P.hover = constrain(P.hover, 1100.0f, 1800.0f);
 }
 
@@ -1030,9 +1143,9 @@ void updateMode() {
   if (!armed) altHold = false;
   else if (altHold && !want) altHoldStop("SELF-LEVEL");
   else if (altHold && !altValid) altHoldStop("ALT LOST-MANUAL");
-  else if (!altHold && flipIn) {
-    if (!altValid) { setMsg("NO BARO"); BEEP_THREE; }
-    else altHoldStart(!inFlight || ch[RX_THR] < 1150);
+  else if (!altHold && want) {                          // level-checked: arming zeroes the baro, so altValid can be
+    if (altValid) altHoldStart(!inFlight || ch[RX_THR] < 1150);   // false for a moment and a one-shot try never came back
+    else if (flipIn) { setMsg("NO BARO"); BEEP_THREE; }
   }
   mode = altHold ? MODE_ALT : MODE_SELF;
 }
@@ -1058,7 +1171,7 @@ void levelCalTick() {
   uint32_t ms = millis();
   if (!levelCalRunning) {
     if (!levelCalRequest) {
-      bool cmd = !armed && rcValid && page != PG_SETUP && ch[RX_THR] < 1100 && ch[RX_YAW] < 1150 && ch[RX_PITCH] < 1150 &&
+      bool cmd = !armed && rcValid && page != PG_SETUP && ch[RX_THR] < 1100 && ch[RX_YAW] < 1300 && ch[RX_PITCH] < 1300 &&
                  fabsf(stick(ch[RX_ROLL])) < 0.3f;
       if (!cmd) { holdSince = 0; return; }
       if (!holdSince) holdSince = ms ? ms : 1;
@@ -1090,7 +1203,7 @@ void trimStickTick() {
   static uint32_t next = 0;
   static bool changed = false;
   uint32_t now = millis();
-  bool cond = !armed && rcValid && page != PG_SETUP && ch[RX_THR] > 1800 && fabsf(stick(ch[RX_YAW])) < 0.3f;
+  bool cond = !armed && rcValid && page != PG_SETUP && ch[RX_THR] > 1600 && fabsf(stick(ch[RX_YAW])) < 0.3f;
   float sr = stick(ch[RX_ROLL]), sp = stick(ch[RX_PITCH]);   // + = right / forward
   int dr = 0, dp = 0;
   if (cond) { dr = sr > 0.5f ? 1 : (sr < -0.5f ? -1 : 0); dp = sp > 0.5f ? 1 : (sp < -0.5f ? -1 : 0); }
@@ -1382,6 +1495,7 @@ void recTick(uint32_t ms) {
   s.flags = (mode == MODE_ALT ? 1 : 0) | (altValid ? 2 : 0) | (altLanded ? 4 : 0) | (fsLanding ? 8 : 0);
   s.vib10 = (uint8_t)constrain(vibration() * 10, 0.0f, 255.0f);
   s.rssi = (int8_t)lroundf(rcRssiF); s.lq = rcLq;
+  s.accUp100 = c16(accUp * 100); s.accCorr100 = c16(accCorr * 100); s.altI10 = c16(altInteg * 10);
   recHead = (recHead + 1) % REC_N;
   if (recCount < REC_N) recCount++;
 }
@@ -1401,15 +1515,16 @@ void recDump() {
     if (f) f.close();
   }
   Serial.printf("REC BEGIN %u samples, %u ms, from %s\n", recCount, REC_MS, fromFlash ? "flash" : "RAM");
-  Serial.println("t,roll,pitch,rollT,pitchT,gR,gP,gY,thr,rcR,rcP,rcY,m1,m2,m3,m4,vbat,ctrl_us,alt,altT,vel,mode,altValid,landed,fsLand,vib,rssi,lq");
+  Serial.println("t,roll,pitch,rollT,pitchT,gR,gP,gY,thr,rcR,rcP,rcY,m1,m2,m3,m4,vbat,ctrl_us,alt,altT,vel,mode,altValid,landed,fsLand,vib,rssi,lq,accUp,accCorr,altI");
   uint16_t start = recCount < REC_N ? 0 : recHead;
   for (uint16_t k = 0; k < recCount; k++) {
     const RecSample &s = recBuf[(start + k) % REC_N];
-    Serial.printf("%.2f,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.2f,%u,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.1f,%d,%u\n",
+    Serial.printf("%.2f,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.2f,%u,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.1f,%d,%u,%.2f,%.2f,%.1f\n",
                   s.t10 / 100.0f, s.roll10 / 10.0f, s.pitch10 / 10.0f, s.rollT10 / 10.0f, s.pitchT10 / 10.0f,
                   s.gR, s.gP, s.gY, s.thr, s.rcR, s.rcP, s.rcY, s.m[0], s.m[1], s.m[2], s.m[3],
                   s.vbat100 / 100.0f, s.ctrlUs, s.alt100 / 100.0f, s.altT100 / 100.0f, s.vel100 / 100.0f,
-                  s.flags & 1, (s.flags >> 1) & 1, (s.flags >> 2) & 1, (s.flags >> 3) & 1, s.vib10 / 10.0f, s.rssi, s.lq);
+                  s.flags & 1, (s.flags >> 1) & 1, (s.flags >> 2) & 1, (s.flags >> 3) & 1, s.vib10 / 10.0f, s.rssi, s.lq,
+                  s.accUp100 / 100.0f, s.accCorr100 / 100.0f, s.altI10 / 10.0f);
     if ((k & 31) == 31) delay(2);
   }
   Serial.println("REC END");
@@ -1418,13 +1533,56 @@ void recDump() {
 
 // ======================= SERIAL COMMANDS =======================
 void printParams() {
-  for (int i = 0; i < N_PARAMS; i++) Serial.printf("  %-13s = %g\n", PARAMS[i].name, P.*(PARAMS[i].m));
+  for (int g = 0; g < G_COUNT; g++) {
+    Serial.printf("[%s]\n", GROUP_NAME[g]);
+    for (int i = 0; i < N_PARAMS; i++)
+      if (PARAMS[i].grp == g) Serial.printf("  %-13s = %g\n", PARAMS[i].name, P.*(PARAMS[i].m));
+  }
+}
+
+// motor test over serial: one motor (or all) at a low duty for 2 s. PROPS OFF.
+#define SERIAL_MOTOR_US 1150
+int8_t serialMotor = -1;            // -1 off, 0..3 = M1..M4, 4 = all
+uint32_t serialMotorUntil = 0;
+void serialMotorTick(uint32_t ms) {   // called after motorsOff() while disarmed
+  if (serialMotor < 0) return;
+  if ((int32_t)(ms - serialMotorUntil) >= 0 || (rcValid && ch[RX_ARM] >= 1700)) { serialMotor = -1; Serial.println("motor test end"); return; }
+  for (int i = 0; i < 4; i++) if (serialMotor == 4 || serialMotor == i) { outUs[i] = SERIAL_MOTOR_US; writeUs(i, SERIAL_MOTOR_US); }
+}
+
+void printStatus() {
+  Serial.printf("%s %s R%+.1f P%+.1f | %.2fV %uS%s | ", armed ? "ARMED" : "SAFE", mode == MODE_ALT ? "ALT" : "SELF", roll, pitch, vBat, cellsUsed, battLow ? " LOW" : "");
+  if (rcValid) Serial.printf("%+.0fdBm %u%% THR %u ARM %u MODE %u", rcRssiF, rcLq, ch[RX_THR], ch[RX_ARM], ch[RX_CH6]); else Serial.print("NO RC");
+  Serial.printf(" | baro %s %+.2fm | hover %.0f vib %.1f loop %uus | %s\n", baroOK ? (baroIsMs ? "MS5611" : "BMP280") : "MISSING", altEst, hoverPoint(), vibration(), loopUs,
+                armBlockText(armBlock));
+}
+
+void printHelp() {
+  Serial.println("help | ? settings | name=value | save | defaults | cal level calibration (flat!)");
+  Serial.println("m1 m2 m3 m4 mall spin 2 s PROPS OFF | stop | st status | S status on/off | stats last flight | D dump flight CSV");
 }
 
 void handleLine(char *s) {
   while (*s == ' ') s++;
   if (!*s) return;
   if (!strcmp(s, "?"))        { printParams(); return; }
+  if (!strcmp(s, "help"))     { printHelp(); return; }
+  if (!strcmp(s, "st"))       { printStatus(); return; }
+  if (!strcmp(s, "cal"))      { levelCalRequest = true; return; }
+  if (!strcmp(s, "stop"))     { serialMotor = -1; Serial.println("motors off"); return; }
+  if (!strcmp(s, "stats")) {
+    Serial.printf("last flight: %.0f s, max alt %.1f m, min V %.2f, max vib %.0f, worst RSSI %.0f, LQ %u%%, gaps %u (max %lu ms), ctrl %u us\n", flightTime,
+                  fst.maxAlt, fst.minVbat, fst.maxVib, fst.minRssi, fst.minLq, rcGapCount, (unsigned long)rcGapMaxMs, fst.maxCtrlUs);
+    Serial.printf("stop reason: %s\n", lastStop);
+    return;
+  }
+  if (s[0] == 'm' && (!strcmp(s, "mall") || (s[1] >= '1' && s[1] <= '4' && !s[2]))) {
+    if (rcValid && ch[RX_ARM] >= 1700) { Serial.println("ARM button off first"); return; }
+    serialMotor = !strcmp(s, "mall") ? 4 : s[1] - '1';
+    serialMotorUntil = millis() + 2000;
+    Serial.printf("spinning %s for 2 s, PROPS OFF! (stop = stop now)\n", s);
+    return;
+  }
   if (!strcmp(s, "D") || !strcmp(s, "d")) { recDump(); return; }
   if (!strcmp(s, "S") || !strcmp(s, "s")) { statusPrint = !statusPrint; return; }
   if (!strcmp(s, "save"))     { Serial.println(paramsSave() ? "saved" : "SAVE FAILED"); return; }
@@ -1442,7 +1600,7 @@ void handleLine(char *s) {
       return;
     }
   }
-  Serial.println("? | name=value | save | defaults | D | S");
+  Serial.println("unknown command, type help");
 }
 
 void serialTick() {
@@ -1457,6 +1615,7 @@ void serialTick() {
   }
 }
 
+#if USE_OLED
 // ======================= OLED SETUP MENU (disarmed, driven by the TX sticks) =======================
 // Open: BOOT button until SETUP shows, or throttle LOW + yaw full LEFT + pitch full FORWARD for 1 s.
 //   pitch fwd/back = cursor up/down      roll right/left = value +/- (hold = repeat; throttle HIGH = x10)
@@ -1478,7 +1637,7 @@ int grpN = 0;
 struct StickKey {                  // stick as a key: -1/0/+1 events with auto-repeat (faster the longer it is held)
   int last = 0; uint32_t next = 0, since = 0;
   int poll(float v) {
-    int d = v > 0.6f ? 1 : (v < -0.6f ? -1 : 0), ev = 0;
+    int d = v > 0.4f ? 1 : (v < -0.4f ? -1 : 0), ev = 0;   // 0.4: yaw only reaches ~0.57
     uint32_t now = millis();
     if (d && d != last) { ev = d; next = now + 400; since = now; }
     else if (d && (int32_t)(now - next) >= 0) { ev = d; next = now + (now - since > 2000 ? 60 : 150); }
@@ -1527,7 +1686,7 @@ void menuTick() {
   static uint32_t openHold = 0;
   uint32_t ms = millis();
   if (page != PG_SETUP) {
-    bool cmd = !armed && rcValid && ch[RX_THR] < 1100 && ch[RX_YAW] < 1150 && ch[RX_PITCH] > 1850;
+    bool cmd = !armed && rcValid && ch[RX_THR] < 1100 && ch[RX_YAW] < 1300 && ch[RX_PITCH] > 1700;
     if (!cmd) openHold = 0;
     else if (!openHold) openHold = ms ? ms : 1;
     else if (ms - openHold > 1000) { openHold = 0; enterSetup(); BEEP_SHORT; }
@@ -1550,7 +1709,7 @@ void menuTick() {
   if (menuGrp == MENU_MOTORS) {                  // motor test: pitch = pick, hold roll RIGHT = spin, yaw left = back
     if (v > 0) mtSel = (mtSel + 4) % 5;
     if (v < 0) mtSel = (mtSel + 1) % 5;
-    mtSpin = sR > 0.6f && ch[RX_ARM] < 1700;
+    mtSpin = sR > 0.4f && ch[RX_ARM] < 1700;
     if (y < 0) { mtSpin = false; menuGrp = -1; menuSel = ACT_MOTORS; }
     return;
   }
@@ -1562,7 +1721,7 @@ void menuTick() {
     if (h) {
       const ParamDef &d = PARAMS[grpIdx[menuSel]];
       float &val = P.*(d.m);
-      float st = d.step * (ch[RX_THR] > 1700 ? 10 : 1);
+      float st = d.step * (ch[RX_THR] > 1600 ? 10 : 1);
       val = constrain(roundf((val + h * st) / d.step) * d.step, d.mn, d.mx);
       filtersSetup();
       dirty = true;
@@ -1580,86 +1739,79 @@ const char *armBlockText(uint8_t b) {
   }
 }
 
-void drawFooter(const char *idle) {
+// 128 x 32: four text rows, baselines at y = 7, 15, 23, 31
+void drawFooter(const char *idle) {  // bottom row: a message (inverted) wins over the normal text
   if ((int32_t)(msgUntil - millis()) > 0) {
-    oled->drawBox(0, 54, 128, 10); oled->setDrawColor(0); oled->drawStr(2, 63, msgText); oled->setDrawColor(1);
-  } else if (idle) oled->drawStr(0, 63, idle);
+    oled->setDrawColor(0); oled->drawBox(0, 24, 128, 8); oled->setDrawColor(1);
+    oled->drawBox(0, 24, 128, 8); oled->setDrawColor(0); oled->drawStr(2, 31, msgText); oled->setDrawColor(1);
+  } else if (idle) oled->drawStr(0, 31, idle);
 }
 
 void drawStatus() {
   char b[32];
-  // header: ARMED (filled box) / SAFE (frame) + mode
-  if (armed) { oled->drawBox(0, 0, 40, 12); oled->setDrawColor(0); oled->drawStr(4, 10, "ARMED"); oled->setDrawColor(1); }
-  else       { oled->drawFrame(0, 0, 40, 12); oled->drawStr(8, 10, "SAFE"); }
+  // row 1: ARMED (inverted) / SAFE + mode
+  if (armed) { oled->drawBox(0, 0, 28, 8); oled->setDrawColor(0); oled->drawStr(2, 7, "ARMED"); oled->setDrawColor(1); }
+  else oled->drawStr(2, 7, "SAFE");
   snprintf(b, sizeof b, "%s%s", mode == MODE_ALT ? (altLanded ? "ALT-GND" : "ALT HOLD") :
            (ch[RX_CH6] >= 1300 && rcValid ? "SELF>ALT" : "SELF"), dirty ? " *" : "");
-  oled->drawStr(46, 10, b);
-
-  // left column
+  oled->drawStr(32, 7, b);
+  // row 2: attitude
   snprintf(b, sizeof b, "R%+5.1f P%+5.1f", roll, pitch);
-  oled->drawStr(0, 22, b);
-  if (!battPresent) oled->drawStr(0, 32, "NO BATTERY");
-  else {
-    bool blink = battLow && ((millis() / 400) & 1);
-    if (blink) { oled->drawBox(0, 24, 84, 10); oled->setDrawColor(0); }
-    if (cellsUsed) snprintf(b, sizeof b, "%5.2fV %4.2f/c", vBat, vBat / cellsUsed); else snprintf(b, sizeof b, "%5.2fV", vBat);
-    oled->drawStr(0, 32, b);
-    oled->setDrawColor(1);
-  }
-  if (rcValid) snprintf(b, sizeof b, "%+.0fdBm %u%%", rcRssiF, rcLq); else snprintf(b, sizeof b, "NO LINK");
-  oled->drawStr(0, 42, b);
-  if (baroOK) snprintf(b, sizeof b, "ALT %+.2fm", altEst); else snprintf(b, sizeof b, "NO BARO");
-  oled->drawStr(0, 52, b);
+  oled->drawStr(0, 15, b);
+  // row 3: battery + link
+  bool blink = battLow && ((millis() / 400) & 1);
+  if (blink) { oled->drawBox(0, 16, 28, 8); oled->setDrawColor(0); }
+  if (battPresent) snprintf(b, sizeof b, "%.2fV", vBat); else snprintf(b, sizeof b, "NOBAT");
+  oled->drawStr(1, 23, b);
+  oled->setDrawColor(1);
+  if (rcValid) snprintf(b, sizeof b, "%.0fdB %u%%", rcRssiF, rcLq); else snprintf(b, sizeof b, "NO LINK");
+  oled->drawStr(32, 23, b);
 
-  // artificial horizon (circle): the line tilts with roll, rises when the nose goes down
-  const int cx = 108, cy = 32, r = 18;
+  // right: artificial horizon (circle), the line tilts with roll and rises when the nose goes down
+  const int cx = 112, cy = 15, r = 15;
   oled->drawCircle(cx, cy, r);
   float rr = roll * DEG_TO_RAD;
   int off = (int)(constrain(pitch / 45.0f, -1.0f, 1.0f) * r * 0.5f);
-  int dx = (int)(cosf(rr) * (r - 4)), dy = (int)(sinf(rr) * (r - 4));
+  int dx = (int)(cosf(rr) * (r - 3)), dy = (int)(sinf(rr) * (r - 3));
   int hy = cy - off;
   oled->drawLine(cx - dx, hy + dy, cx + dx, hy - dy);
-  oled->drawHLine(cx - 7, cy, 4); oled->drawHLine(cx + 4, cy, 4); oled->drawPixel(cx, cy);   // fixed aircraft marker
+  oled->drawHLine(cx - 6, cy, 3); oled->drawHLine(cx + 4, cy, 3); oled->drawPixel(cx, cy);   // fixed aircraft marker
+  // throttle: thin vertical bar left of the circle
+  int th = (int)(constrain((ch[RX_THR] - 1000) / 1000.0f, 0.0f, 1.0f) * 30);
+  oled->drawFrame(92, 0, 3, 32);
+  oled->drawVLine(93, 31 - th, th);
 
-  // throttle bar
-  float th = constrain((ch[RX_THR] - 1000) / 1000.0f, 0.0f, 1.0f);
-  oled->drawFrame(0, 54, 86, 3);
-  oled->drawHLine(0, 55, (int)(86 * th));
-
-  // bottom line: message, then warnings, then why it will not arm / READY
-  if ((int32_t)(msgUntil - millis()) > 0) drawFooter(nullptr);
+  // row 4: message, then warnings, then why it will not arm / READY, in flight the altitude
+  if ((int32_t)(msgUntil - millis()) > 0) { drawFooter(nullptr); return; }
+  const char *w = !rcValid ? "NO RC SIGNAL" : !imuOK ? "IMU FAULT" : battLow ? "LOW BATTERY" :
+                  armed ? nullptr : (levelCalRunning ? "LEVEL CAL: STILL" : armBlockText(armBlock));
+  if (w) oled->drawStr(0, 31, w);
   else {
-    const char *w = !rcValid ? "NO RC SIGNAL" : !imuOK ? "IMU FAULT" : battLow ? "LOW BATTERY" :
-                    armed ? "" : (levelCalRunning ? "LEVEL CAL: STILL" : armBlockText(armBlock));
-    oled->setFont(u8g2_font_5x8_tf);
-    oled->drawStr(0, 63, w);
-    oled->setFont(u8g2_font_6x10_tf);
+    if (baroOK) snprintf(b, sizeof b, "ALT %+.2fm", altEst); else snprintf(b, sizeof b, "NO BARO");
+    oled->drawStr(0, 31, b);
   }
 }
 
 void drawSensors() {
   char b[32];
-  oled->drawStr(0, 9, "SENSORS");
-  snprintf(b, sizeof b, "R%+6.1f P%+6.1f", roll, pitch);                               oled->drawStr(0, 19, b);
-  snprintf(b, sizeof b, "acc R%+5.1f P%+5.1f", accRollRaw - P.rollTrim, accPitchRaw - P.pitchTrim); oled->drawStr(0, 28, b);
-  snprintf(b, sizeof b, "gyro %+4.0f %+4.0f %+4.0f", gyro[0], gyro[1], gyro[2]);          oled->drawStr(0, 37, b);
-  snprintf(b, sizeof b, "vib %.1f  loop %uus", vibration(), loopUs);                       oled->drawStr(0, 46, b);
-  if (baroOK) snprintf(b, sizeof b, "baro %+.2fm v%+.2f", baroAlt, velEst); else snprintf(b, sizeof b, "baro: not found");
+  snprintf(b, sizeof b, "R%+6.1f P%+6.1f vib%4.1f", roll, pitch, vibration());                  oled->drawStr(0, 7, b);
+  snprintf(b, sizeof b, "acc R%+5.1f P%+5.1f", accRollRaw - P.rollTrim, accPitchRaw - P.pitchTrim); oled->drawStr(0, 15, b);
+  snprintf(b, sizeof b, "gyro %+4.0f %+4.0f %+4.0f", gyro[0], gyro[1], gyro[2]);                 oled->drawStr(0, 23, b);
+  if (baroOK) snprintf(b, sizeof b, "baro %+.2f v%+.2f %uus", baroAlt, velEst, loopUs); else snprintf(b, sizeof b, "baro: not found %uus", loopUs);
   drawFooter(b);
 }
 
 void drawMotorTest() {
   static const char *const NM[5] = {"M1 rear right", "M2 front right", "M3 rear left", "M4 front left", "ALL"};
-  oled->drawStr(0, 8, "MOTOR TEST  PROPS OFF");
-  oled->drawHLine(0, 10, 128);
-  for (int i = 0; i < 5; i++) {
-    int y = 12 + i * 9;
-    if (i == mtSel) { oled->drawBox(0, y, 128, 9); oled->setDrawColor(0); }
-    oled->drawStr(2, y + 8, NM[i]);
-    if (i == mtSel && mtSpin) oled->drawStr(98, y + 8, "SPIN");
+  oled->drawStr(0, 7, ch[RX_ARM] >= 1700 ? "MOTORS: ARM BUTTON OFF" : "MOTORS PROPS OFF R=spin");
+  int top = constrain(mtSel - 1, 0, 2);          // three rows of the five
+  for (int i = top; i < top + 3; i++) {
+    int y = 8 + (i - top) * 8;
+    if (i == mtSel) { oled->drawBox(0, y, 128, 8); oled->setDrawColor(0); }
+    oled->drawStr(2, y + 7, NM[i]);
+    if (i == mtSel && mtSpin) oled->drawStr(102, y + 7, "SPIN");
     oled->setDrawColor(1);
   }
-  oled->drawStr(0, 63, ch[RX_ARM] >= 1700 ? "ARM button OFF first" : "roll R=spin yaw L=back");
 }
 
 void drawMenu() {
@@ -1668,77 +1820,63 @@ void drawMenu() {
   const char *title = menuGrp < 0 ? "SETUP" : GROUP_NAME[menuGrp];
   if (menuGrp == G_BATT) snprintf(b, sizeof b, "%s %.2fV%s", title, vBat, dirty ? " *" : "");   // live V to match a meter
   else snprintf(b, sizeof b, "%s%s", title, dirty ? " *" : "");
-  oled->drawStr(0, 8, b);
-  oled->drawHLine(0, 10, 128);
+  oled->drawStr(0, 7, b);
   int n = menuGrp < 0 ? MAIN_COUNT : grpN;
-  const int ROWS = 4;
+  const int ROWS = 3;
   if (menuSel < menuTop) menuTop = menuSel;
   if (menuSel >= menuTop + ROWS) menuTop = menuSel - ROWS + 1;
   for (int r = 0; r < ROWS && menuTop + r < n; r++) {
-    int it = menuTop + r, y = 12 + r * 10;
+    int it = menuTop + r, y = 8 + r * 8;
     bool sel = it == menuSel;
-    if (sel) { oled->drawBox(0, y, 125, 10); oled->setDrawColor(0); }
+    if (sel) { oled->drawBox(0, y, 125, 8); oled->setDrawColor(0); }
     if (menuGrp < 0) {
       static const char *const ACT[] = {"LEVEL CALIBRATE", "MOTOR TEST", "(ESC CAL: n/a)", "SAVE", "DEFAULTS (x2)", "EXIT"};
-      oled->drawStr(2, y + 8, it < G_COUNT ? GROUP_NAME[it] : ACT[it - G_COUNT]);
-      oled->drawStr(118, y + 8, ">");
+      oled->drawStr(2, y + 7, it < G_COUNT ? GROUP_NAME[it] : ACT[it - G_COUNT]);
+      oled->drawStr(118, y + 7, ">");
     } else {
       const ParamDef &d = PARAMS[grpIdx[it]];
-      oled->drawStr(2, y + 8, d.label);
+      oled->drawStr(2, y + 7, d.label);
       snprintf(b, sizeof b, "%.*f", d.dec, P.*(d.m));
-      oled->drawStr(123 - oled->getStrWidth(b), y + 8, b);
+      oled->drawStr(123 - oled->getStrWidth(b), y + 7, b);
     }
     oled->setDrawColor(1);
   }
-  if (n > ROWS) { int bh = 40 * ROWS / n, by = 12 + (40 - bh) * menuTop / (n - ROWS); oled->drawBox(126, by, 2, bh); }
-  drawFooter(menuGrp < 0 ? "yaw R=open L=exit" : "roll=+/- yaw L=back");
+  if (n > ROWS) { int bh = max(24 * ROWS / n, 3), by = 8 + (24 - bh) * menuTop / (n - ROWS); oled->drawBox(126, by, 2, bh); }
+  drawFooter(nullptr);
 }
 
 void drawStats() {
   char b[40];
-  oled->drawStr(0, 8, "LAST FLIGHT");
-  snprintf(b, sizeof b, "time %.0fs  alt max %.1fm", flightTime, fst.maxAlt);                 oled->drawStr(0, 18, b);
-  snprintf(b, sizeof b, "Vmin %.2f  vib max %.0f", fst.minVbat, fst.maxVib);                   oled->drawStr(0, 27, b);
-  snprintf(b, sizeof b, "RSSI %.0f LQ %u%% gaps %u", fst.minRssi, fst.minLq, rcGapCount);       oled->drawStr(0, 36, b);
-  snprintf(b, sizeof b, "gap max %lums ctrl %uus", (unsigned long)rcGapMaxMs, fst.maxCtrlUs);  oled->drawStr(0, 45, b);
-  oled->setFont(u8g2_font_4x6_tf);                                     // stop reason can be long: small font, 2 lines
-  oled->drawStr(0, 54, "stop:");
-  char l1[33], l2[33];
-  strlcpy(l1, lastStop, sizeof l1);
-  strlcpy(l2, strlen(lastStop) > 32 ? lastStop + 32 : "", sizeof l2);
-  oled->drawStr(22, 54, l1);
-  oled->drawStr(0, 62, l2);
-  oled->setFont(u8g2_font_6x10_tf);
+  snprintf(b, sizeof b, "%.0fs alt %.1fm Vmin %.2f", flightTime, fst.maxAlt, fst.minVbat);        oled->drawStr(0, 7, b);
+  snprintf(b, sizeof b, "vib %.0f RSSI %.0f LQ %u%%", fst.maxVib, fst.minRssi, fst.minLq);        oled->drawStr(0, 15, b);
+  snprintf(b, sizeof b, "gaps %u/%lums ctrl %uus", rcGapCount, (unsigned long)rcGapMaxMs, fst.maxCtrlUs); oled->drawStr(0, 23, b);
+  drawFooter(lastStop);                                   // stop reason (first 25 characters; full text on serial at boot)
 }
 
-void drawTrend() {                  // last recorded flight: altitude (line) + hold target (dots) on top, battery below
+void drawTrend() {                  // last recorded flight: altitude (line) + hold target (dots). Battery: see STATS
   char b[32];
-  if (recCount < 2) { oled->drawStr(0, 8, "TREND"); oled->drawStr(0, 30, "no flight recorded"); oled->drawStr(0, 42, "since power-up"); return; }
+  if (recCount < 2) { oled->drawStr(0, 15, "TREND: no flight"); oled->drawStr(0, 23, "since power-up"); return; }
   uint16_t start = recCount < REC_N ? 0 : recHead;
-  float aMin = 1e9, aMax = -1e9, vMin = 1e9, vMax = -1e9;
+  float aMin = 1e9, aMax = -1e9;
   for (uint16_t k = 0; k < recCount; k++) {
     const RecSample &s = recBuf[(start + k) % REC_N];
     aMin = min(aMin, min(s.alt100, s.altT100) / 100.0f); aMax = max(aMax, max(s.alt100, s.altT100) / 100.0f);
-    if (s.vbat100) { vMin = min(vMin, s.vbat100 / 100.0f); vMax = max(vMax, s.vbat100 / 100.0f); }
   }
   if (aMax - aMin < 0.5f) aMax = aMin + 0.5f;
-  if (vMax - vMin < 0.2f) vMax = vMin + 0.2f;
   snprintf(b, sizeof b, "ALT %.1f..%.1fm %.0fs", aMin, aMax, recCount * REC_MS / 1000.0f);
-  oled->drawStr(0, 8, b);
+  oled->drawStr(0, 7, b);
   for (int x = 0; x < 128; x++) {
     const RecSample &s = recBuf[(start + (uint32_t)x * (recCount - 1) / 127) % REC_N];
-    int ya = 38 - (int)((s.alt100 / 100.0f - aMin) / (aMax - aMin) * 27);
-    int yt = 38 - (int)((s.altT100 / 100.0f - aMin) / (aMax - aMin) * 27);
+    int ya = 31 - (int)((s.alt100 / 100.0f - aMin) / (aMax - aMin) * 22);
+    int yt = 31 - (int)((s.altT100 / 100.0f - aMin) / (aMax - aMin) * 22);
     oled->drawPixel(x, ya);
     if ((s.flags & 1) && (x & 1)) oled->drawPixel(x, yt);   // target only while ALT HOLD was on
-    if (s.vbat100) oled->drawPixel(x, 63 - (int)((s.vbat100 / 100.0f - vMin) / (vMax - vMin) * 14));
   }
-  if (vMin < 1e8) { snprintf(b, sizeof b, "BAT %.2f..%.2fV", vMin, vMax); oled->drawStr(0, 48, b); }
 }
 
 void drawPage() {
   oled->clearBuffer();
-  oled->setFont(u8g2_font_6x10_tf);
+  oled->setFont(u8g2_font_5x8_tf);
   if (page == PG_SETUP && !armed) drawMenu();
   else if (page == PG_SENSORS && !armed) drawSensors();
   else if (page == PG_STATS && !armed) drawStats();
@@ -1761,14 +1899,14 @@ void buttonTick() {                // BOOT button: next page (disarmed)
 
 void oledTick(uint32_t ms) {
   static uint32_t lastDraw = 0;
-  static int8_t slice = -1;          // -1 = idle, 0..15 = next half tile row to send
+  static int8_t slice = -1;          // -1 = idle, 0..7 = next half tile row to send (32 px = 4 tile rows)
   static bool frozen = false;
   if (armed) {                       // frozen in flight (drawing costs loop time): one last frame at arming
     if (!frozen && slice < 0) { page = PG_STATUS; drawPage(); slice = 0; frozen = true; }
   } else frozen = false;
   if (slice >= 0) {
     oled->updateDisplayArea((slice & 1) * 8, slice >> 1, 8, 1);   // 64 x 8 px, ~1.5 ms
-    if (++slice >= 16) slice = -1;
+    if (++slice >= 8) slice = -1;
     return;
   }
   if (!armed && ms - lastDraw >= (page == PG_SETUP ? 80u : 200u)) { lastDraw = ms; drawPage(); slice = 0; }
@@ -1776,11 +1914,23 @@ void oledTick(uint32_t ms) {
 void splash(const char *l1, const char *l2) {
   oled->clearBuffer();
   oled->setFont(u8g2_font_6x10_tf);
-  oled->drawStr(0, 12, FW_VERSION);
-  oled->drawStr(0, 32, l1);
-  oled->drawStr(0, 46, l2);
+  oled->drawStr(0, 9, FW_VERSION);
+  oled->drawStr(0, 20, l1);
+  oled->drawStr(0, 31, l2);
   oled->sendBuffer();
 }
+
+#else  // !USE_OLED
+const char *armBlockText(uint8_t b) {
+  switch (b) {
+    case AB_THROTTLE: return "THROTTLE HIGH"; case AB_SWITCH: return "ARM SW LOW 1ST";
+    case AB_IMU: return "IMU FAIL"; case AB_TILT: return "TILTED";
+    case AB_NOLINK: return "NO RADIO"; case AB_CAL: return "CALIBRATING"; case AB_SETUP: return "IN SETUP";
+    default: return "READY";
+  }
+}
+void splash(const char *l1, const char *l2) { Serial.printf("%s %s\n", l1, l2); }
+#endif
 
 // ======================= SETUP / LOOP =======================
 void setup() {
@@ -1791,7 +1941,7 @@ void setup() {
   if (prefs.begin("sfcb", false)) { escCal = prefs.getUChar("esccal", 0) != 0; if (escCal) prefs.putUChar("esccal", 0); prefs.end(); }
   escCal = false;                    // brushed: never drive the motors to MAX at power-up
   motorsOff();                       // 0 % duty at once
-  pinMode(PIN_BUZZ, OUTPUT); digitalWrite(PIN_BUZZ, LOW);
+  ledcAttach(PIN_BUZZ, BUZZ_HZ, 8); buzz(false);
   pinMode(PIN_BTN, INPUT_PULLUP);
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);          // USB prints never block the loop
@@ -1801,13 +1951,15 @@ void setup() {
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(I2C_HZ);
+#if USE_OLED
   oled = &oledDev;
   oled->setBusClock(I2C_HZ);
   oled->begin();
+#endif
   if (escCal) {
     Serial.println("ESC CAL: MAX 5 s, then MIN 5 s. PROPS OFF!");
     splash("ESC CAL: MAX", "wait for ESC beeps");
-    digitalWrite(PIN_BUZZ, HIGH); delay(200); digitalWrite(PIN_BUZZ, LOW);
+    buzz(true); delay(200); buzz(false);
     delay(4500);
     motorsOff();
     splash("ESC CAL: MIN", "wait for confirm");
@@ -1818,7 +1970,12 @@ void setup() {
   splash("IMU...", "");
   if (!mpuInit()) {
     splash("MPU6050 NOT FOUND", "check wiring");
-    while (true) { digitalWrite(PIN_BUZZ, (millis() / 100) & 1); delay(10); }
+    uint32_t lastTell = 0;
+    while (true) {                   // stopped, motors off: keep telling, the PC may connect later
+      buzz((millis() / 100) & 1);
+      if (millis() - lastTell > 2000) { lastTell = millis(); Serial.println("STOPPED: MPU6050 not found - check VCC 3V3, GND, SDA GPIO6, SCL GPIO7"); }
+      delay(10);
+    }
   }
   filtersSetup();
   baroOK = baroInit();
@@ -1829,7 +1986,7 @@ void setup() {
   recFsOk = LittleFS.begin(true);
   Serial.printf("Recorder storage %s. Hover point %.0f us. Trims R%.1f P%.1f\n",
                 recFsOk ? "ok" : "N/A", hoverPoint(), P.rollTrim, P.pitchTrim);
-  Serial.println("Commands: ? | name=value | save | defaults | D | S");
+  printHelp();
   BEEP_SHORT;
 }
 
@@ -1863,11 +2020,14 @@ void loop() {
     motorsOff();
     levelCalTick();
     trimStickTick();
+#if USE_OLED
     menuTick();
     buttonTick();
     if (page == PG_SETUP && menuGrp == MENU_MOTORS && mtSpin && rcValid) {   // motor test (props OFF)
       for (int i = 0; i < 4; i++) if (mtSel == 4 || mtSel == i) { outUs[i] = MOTOR_TEST_US; writeUs(i, MOTOR_TEST_US); }
     } else mtSpin = false;
+#endif
+    serialMotorTick(ms);
   }
   ctrlUs = micros() - now;
   if (ctrlUs > ctrlMaxUs) ctrlMaxUs = ctrlUs;
@@ -1877,7 +2037,9 @@ void loop() {
   osdTick(ms);                       // DJI O4 OSD (MSP DisplayPort)
   buzzerTick(ms);
   telemetryTick(ms);
+#if USE_OLED
   oledTick(ms);
+#endif
   if (!armed) serialTick();
 
   if (Serial && statusPrint && ms - lastPrint >= 200) {   // only with a PC connected

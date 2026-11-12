@@ -109,7 +109,7 @@ struct __attribute__((packed)) ControlPacket {
   uint8_t  crc;
 };
 
-enum ArmBlock : uint8_t { AB_NONE, AB_THROTTLE, AB_SWITCH, AB_IMU, AB_TILT, AB_NOLINK, AB_SETUP };
+enum ArmBlock : uint8_t { AB_NONE, AB_THROTTLE, AB_SWITCH, AB_IMU, AB_TILT, AB_NOLINK, AB_SETUP, AB_CAL };
 
 struct __attribute__((packed)) TelemetryPacket {
   uint16_t magic;
@@ -126,6 +126,21 @@ struct __attribute__((packed)) TelemetryPacket {
   int8_t   rssi;      // dBm the FC receives this TX with (smoothed), 0 = unknown
   uint8_t  lq;        // % of this TX's packets the FC received in the last second
   uint8_t  crc;
+};
+
+// Telemetry from SimpleFC / the NodeMCU FC: same 19-byte size, its own magic and layout. Converted to TelemetryPacket on
+// reception, so the screen and buzzer work the same with any FC; altitude and the extra flags are kept separately.
+static const uint16_t SIMPLE_TLM_MAGIC = 0xC3F2;
+struct __attribute__((packed)) SimpleTelemetry {
+  uint16_t magic;
+  uint8_t  bindId, armed, mode, armBlock;   // mode 0 SELF, 1 ALT; armBlock 6 = calibrating, 7 = in setup
+  int16_t  roll10, pitch10;
+  uint16_t vbat100;
+  uint8_t  cells;
+  uint8_t  flags;                           // bit0 batt present, 1 batt LOW, 2 alt valid, 3 landed, 4 failsafe land, 5 no baro
+  int16_t  alt100;                          // cm
+  int8_t   rssi;
+  uint8_t  lq, crc;
 };
 
 // GPS state from the FC (5 Hz, its own size)
@@ -357,6 +372,9 @@ static volatile bool fcMacKnown = false;
 static bool          fcPeerAdded = false;
 
 static GpsTelemetry      gtel;
+static volatile uint32_t lastSimpleMs = 0;  // last SimpleFC-style packet (0 = none)
+static uint8_t           simpleFlags = 0;
+static int16_t           simpleAlt100 = 0;
 static volatile uint32_t lastGpsMs = 0;
 
 static void handleTelem(const uint8_t *mac, const uint8_t *data, int len, int8_t rssi) {
@@ -370,8 +388,24 @@ static void handleTelem(const uint8_t *mac, const uint8_t *data, int len, int8_t
   if (len != sizeof(TelemetryPacket)) return;
   TelemetryPacket t;
   memcpy(&t, data, sizeof(t));
-  if (t.magic != PKT_MAGIC || t.bindId != BIND_ID) return;
+  if (t.bindId != BIND_ID) return;
   if (crc8((const uint8_t *)&t, sizeof(t) - 1) != t.crc) return;
+  if (t.magic == SIMPLE_TLM_MAGIC) {            // SimpleFC layout -> this TX's layout
+    SimpleTelemetry s;
+    memcpy(&s, data, sizeof(s));
+    t.magic = PKT_MAGIC;
+    t.mode = s.mode == 1 ? 2 : 0;               // here 0 SELF, 2 ALT
+    t.armBlock = s.armBlock == 6 ? AB_CAL : (s.armBlock == 7 ? AB_SETUP : s.armBlock);
+    t.loopUs = 0;
+    t.vbat100 = s.vbat100;
+    t.cells = s.cells;
+    t.battFlags = s.flags & 3;                  // bits 2/3 mean obstacle / avoidance here: never set them
+    t.rssi = s.rssi;
+    t.lq = s.lq;
+    portENTER_CRITICAL(&stMux);
+    lastSimpleMs = millis(); simpleFlags = s.flags; simpleAlt100 = s.alt100;
+    portEXIT_CRITICAL(&stMux);
+  } else if (t.magic != PKT_MAGIC) return;
   portENTER_CRITICAL(&stMux);
   telem = t;
   lastTelemMs = millis();
@@ -760,6 +794,7 @@ static const char *armBlockText(uint8_t b) {
     case AB_TILT:     return "TILTED";
     case AB_NOLINK:   return "NO LINK";
     case AB_SETUP:    return "IN SETUP";
+    case AB_CAL:      return "CAL";
     default:          return "";
   }
 }
@@ -774,6 +809,10 @@ static void drawMain() {
   portEXIT_CRITICAL(&stMux);
   bool linkOk = lt != 0 && millis() - lt < 500;
   bool blink = (millis() / 300) & 1;
+
+  uint32_t ls; uint8_t sFlags; int16_t sAlt;
+  portENTER_CRITICAL(&stMux); ls = lastSimpleMs; sFlags = simpleFlags; sAlt = simpleAlt100; portEXIT_CRITICAL(&stMux);
+  bool simple = ls && millis() - ls < 1000;     // the FC talking is SimpleFC / NodeMCU
 
   display.setTextSize(1);
   if (simMode) drawSimHeader(blink);
@@ -794,6 +833,8 @@ static void drawMain() {
   }
   display.setCursor(44, 0);
   if (rthRequest && !(linkOk && t.mode == 4)) { if (blink) display.print("RTH?"); }   // asked, FC not (yet) flying it
+  else if (linkOk && simple && (sFlags & 16)) { if (blink) display.print("LAND"); }   // SimpleFC: failsafe auto-land
+  else if (linkOk && simple && (sFlags & 8)) display.print("ALT-G");                  // SimpleFC: alt hold, on the ground
   else if (linkOk) display.print(t.mode == 4 ? "RTH" : t.mode == 3 ? "POS" : (t.mode == 2 ? "ALT" : (t.mode ? "ACRO" : "SELF")));  // mode from the FC
   if (linkOk) {
     // signal of the WEAKER direction (FC hears TX / TX hears FC) and the lower link quality of the two
@@ -814,7 +855,7 @@ static void drawMain() {
   GpsTelemetry g;
   uint32_t lg;
   portENTER_CRITICAL(&stMux); g = gtel; lg = lastGpsMs; portEXIT_CRITICAL(&stMux);
-  if (lg && millis() - lg < 1000) {
+  if (simple || (lg && millis() - lg < 1000)) {
     bool fcPresent = linkOk && (t.battFlags & 1), fcLow = t.battFlags & 2;
     if (fcPresent && fcLow && blink) { display.fillRect(0, 8, 40, 8, OLED_WHITE); display.setTextColor(OLED_BLACK); }
     display.setCursor(2, 8);
@@ -822,7 +863,11 @@ static void drawMain() {
     else           display.print("FC --");
     display.setTextColor(OLED_WHITE);
     display.setCursor(44, 8);
-    if (!(g.flags & 64))     display.print("NO GPS");
+    if (simple) {                                // SimpleFC: altitude instead of GPS
+      if (sFlags & 4)        display.printf("%+.1fm", sAlt / 100.0f);
+      else if (sFlags & 32)  display.print("NOBARO");
+    }
+    else if (!(g.flags & 64)) display.print("NO GPS");
     else if (g.flags & 1)    display.printf("%2us%4um", g.sats, (unsigned)min<uint16_t>(g.distHome, 9999));
     else                     display.printf("%2us WAIT", g.sats);
 #if USE_TX_VBAT

@@ -18,7 +18,10 @@
  *   Telemetry loss only WARNS ("NO TELEMETRY"); the TX never disarms by itself (the FC has its own failsafe).
  *
  * Channels: THR ROLL PITCH YAW ARM CH6 (1000..2000), 50 packets/s.
- * Libraries: U8g2. Board: ESP32C3 Dev Module, USB CDC On Boot: Enabled.
+ *   SIM MODE (menu > "Sim mode (BT)"): restarts as Bluetooth gamepad "SimpleTX Sim" for FPV simulators (ESP-NOW off).
+ *   Axes: X roll, Y pitch, Z throttle, RZ yaw, RX arm, RY mode. Buttons: 1 = ARM on, 2 = MODE ALT.
+ *   One boot only: the next power-up (or menu > "Sim mode (BT)" = EXIT) is the normal transmitter again.
+ * Libraries: U8g2, ESP32-BLE-Gamepad (+ NimBLE-Arduino). Board: ESP32C3 Dev Module, USB CDC On Boot: Enabled.
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -27,6 +30,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <U8g2lib.h>
+#include <BleGamepad.h>
 
 // ======================= CONFIG =======================
 #define FW_VERSION "SimpleTX 1.0"
@@ -94,7 +98,7 @@ struct Settings {
 enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
 enum UiState { UI_MAIN, UI_MENU, UI_CALIB };
 enum MenuItem { MI_CALIB, MI_EXPO, MI_THR_MID, MI_THR_MAX, MI_THR_EXPO, MI_RANGE, MI_YAW_RANGE, MI_TRIM_R, MI_TRIM_P, MI_TRIM_Y, MI_REV_T, MI_REV_R, MI_REV_P, MI_REV_Y,
-                MI_DB_RP, MI_DB_Y, MI_DB_T, MI_FILT, MI_BUZZ, MI_VRATIO, MI_CELLS, MI_WARN, MI_SAVE, MI_EXIT, MI_COUNT };
+                MI_DB_RP, MI_DB_Y, MI_DB_T, MI_FILT, MI_BUZZ, MI_VRATIO, MI_CELLS, MI_WARN, MI_SIM, MI_SAVE, MI_EXIT, MI_COUNT };
 struct StickKey {                      // stick as a key with auto-repeat
   int last = 0; uint32_t next = 0;
   int poll(float v) {
@@ -226,6 +230,7 @@ static float txRssiF = 0;
 static uint8_t fcMac[6];
 static volatile bool fcMacKnown = false;
 static bool fcPeerAdded = false;
+static bool simMode = false;                   // Bluetooth gamepad for simulators instead of ESP-NOW
 static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static uint8_t crc8(const uint8_t *d, size_t n) {
@@ -347,7 +352,7 @@ static void radioTask(void *) {
       p.channel = WIFI_CH; p.ifidx = WIFI_IF_STA; p.encrypt = false;
       fcPeerAdded = esp_now_add_peer(&p) == ESP_OK || esp_now_is_peer_exist(fcMac);
     }
-    esp_now_send(fcPeerAdded ? fcMac : BCAST, (const uint8_t *)&pkt, sizeof pkt);
+    if (!simMode) esp_now_send(fcPeerAdded ? fcMac : BCAST, (const uint8_t *)&pkt, sizeof pkt);
 
 #if USE_TX_VBAT
     float v = analogReadMilliVolts(PIN_VBAT) * 0.001f * c.vRatio100 / 100.0f;
@@ -436,7 +441,7 @@ static const char *MENU_LABEL[MI_COUNT] = {
   "Calibrate sticks", "Expo", "Thr centre", "Thr max", "Thr expo", "R/P range", "Yaw range", "Trim roll", "Trim pitch", "Trim yaw",
   "Rev throttle", "Rev roll", "Rev pitch", "Rev yaw",
   "Deadband R/P", "Deadband yaw", "Deadband thr", "Stick filter", "Buzzer",
-  "TX batt ratio", "TX cells", "TX warn V/cell", "Save & exit", "Exit (no save)"
+  "TX batt ratio", "TX cells", "TX warn V/cell", "Sim mode (BT)", "Save & exit", "Exit (no save)"
 };
 static int menuSel = 0, menuTop = 0;
 static StickKey keyV, keyH;
@@ -464,6 +469,7 @@ static void menuValue(int item, char *b, size_t n) {
     case MI_DB_T:   snprintf(b, n, "%u%%", c.dbThr); break;
     case MI_FILT:   if (c.filtHz) snprintf(b, n, "%uHz", c.filtHz); else snprintf(b, n, "OFF"); break;
     case MI_BUZZ:   snprintf(b, n, "%s", c.buzzerOff ? "OFF" : "ON"); break;
+    case MI_SIM:    snprintf(b, n, "%s", simMode ? "EXIT" : "START"); break;
     case MI_VRATIO: snprintf(b, n, "%.2f", c.vRatio100 / 100.0f); break;
     case MI_CELLS:  if (c.cells) snprintf(b, n, "%uS", c.cells); else snprintf(b, n, "AUTO"); break;
     case MI_WARN:   snprintf(b, n, "%.2f", c.warnCell100 / 100.0f); break;
@@ -526,6 +532,69 @@ static const char *armBlockText(uint8_t b) {
 
 static void inverted(int x, int y, int w, bool on) { if (on) { oled.setDrawColor(1); oled.drawBox(x, y, w, 9); oled.setDrawColor(0); } }
 
+// ======================= SIM MODE (BLE gamepad) =======================
+// One boot only: choosing SIM MODE stores a flag and restarts; that boot clears the flag again, so the next power-up is
+// always the normal transmitter. In SIM MODE ESP-NOW is never started (the radio is used by Bluetooth).
+static BleGamepad *gamepad = nullptr;
+static void restartSim(bool on) {
+  if (prefs.begin("stx", false)) { prefs.putUChar("sim", on ? 1 : 0); prefs.end(); }
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(10, 34, on ? "Starting SIM MODE" : "Leaving SIM MODE");
+  oled.sendBuffer();
+  delay(300);
+  ESP.restart();
+}
+static bool takeSimFlag() {
+  bool on = false;
+  if (prefs.begin("stx", false)) { on = prefs.getUChar("sim", 0); if (on) prefs.putUChar("sim", 0); prefs.end(); }
+  return on;
+}
+static void simBegin() {
+  gamepad = new BleGamepad("SimpleTX Sim", "Espressif", 100);
+  BleGamepadConfiguration gc;
+  gc.setControllerType(CONTROLLER_TYPE_JOYSTICK);
+  gc.setAutoReport(false);
+  gc.setButtonCount(2);
+  gc.setHatSwitchCount(0);
+  gc.setWhichSpecialButtons(false, false, false, false, false, false, false, false);
+  gc.setWhichAxes(true, true, true, true, true, true, false, false);
+  gc.setWhichSimulationControls(false, false, false, false, false);
+  gc.setAxesMin(0);
+  gc.setAxesMax(32767);
+  gamepad->begin(&gc);
+}
+static int16_t usToAxis(uint16_t us) { return (int16_t)((constrain((int)us, 1000, 2000) - 1000) * 32767L / 1000); }
+static void simTick(uint32_t now) {            // 50 Hz, only when something changed (or every 0.5 s)
+  static uint32_t ms = 0, lastSend = 0;
+  static uint16_t last[NUM_CH];
+  if (!gamepad || now - ms < SEND_MS) return;
+  ms = now;
+  if (!gamepad->isConnected()) return;
+  uint16_t c[NUM_CH];
+  portENTER_CRITICAL(&stMux); for (int i = 0; i < NUM_CH; i++) c[i] = chOut[i]; portEXIT_CRITICAL(&stMux);
+  if (!memcmp(c, last, sizeof c) && now - lastSend < 500) return;
+  memcpy(last, c, sizeof c);
+  lastSend = now;
+  gamepad->setAxes(usToAxis(c[CH_ROLL]), usToAxis(c[CH_PITCH]), usToAxis(c[CH_THR]),
+                   usToAxis(c[CH_ARM]), usToAxis(c[CH_CH6]), usToAxis(c[CH_YAW]));
+  if (c[CH_ARM] > 1500) gamepad->press(BUTTON_1); else gamepad->release(BUTTON_1);
+  if (c[CH_CH6] > 1250) gamepad->press(BUTTON_2); else gamepad->release(BUTTON_2);
+  gamepad->sendReport();
+}
+static void drawSimHeader(uint32_t now, float tv) {
+  bool con = gamepad && gamepad->isConnected(), blink = (now / 300) & 1;
+  char b[24];
+  inverted(0, 0, 44, true); oled.drawStr(2, 8, "SIM MODE"); oled.setDrawColor(1);
+  oled.drawStr(50, 8, con ? "BT CONNECTED" : (blink ? "BT PAIRING.." : ""));
+  oled.drawStr(2, 17, armRequest ? "ARM ON" : "arm off");
+  oled.drawStr(44, 17, modeAlt ? "ALT" : "SELF");
+#if USE_TX_VBAT
+  if (txBattPresent) snprintf(b, sizeof b, "TX%5.2fV", tv); else snprintf(b, sizeof b, "TX USB");
+  oled.drawStr(86, 17, b);
+#endif
+}
+
 static void drawMain(uint32_t now) {
   uint16_t ch[NUM_CH]; TelemetryPacket t; uint32_t lt; float tv;
   portENTER_CRITICAL(&stMux);
@@ -536,6 +605,8 @@ static void drawMain(uint32_t now) {
   char b[24];
   oled.setFont(u8g2_font_5x8_tf);
 
+  if (simMode) drawSimHeader(now, tv);
+  else {
   // row 1: armed/safe | mode | RSSI + LQ of the weaker direction
   if (link && t.armed) { inverted(0, 0, 30, true); oled.drawStr(2, 8, "ARMED"); oled.setDrawColor(1); }
   else if (armRequest) { if (blink) oled.drawStr(2, 8, "ARM?"); }
@@ -568,6 +639,7 @@ static void drawMain(uint32_t now) {
   oled.drawStr(86, 17, b);
   oled.setDrawColor(1);
 #endif
+  }
   oled.drawHLine(0, 19, 128);
 
   static const char *NAMES[NUM_CH] = {"THR", "ROL", "PIT", "YAW", "ARM", "MOD"};
@@ -649,11 +721,12 @@ void setup() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
   oled.drawStr(10, 24, FW_VERSION);
-  oled.drawStr(10, 40, "ESP-NOW ch 13");
+  simMode = takeSimFlag();
+  oled.drawStr(10, 40, simMode ? "SIM MODE (BT)" : "ESP-NOW ch 13");
   oled.sendBuffer();
 
   loadSettings();
-  radioBegin();
+  if (simMode) simBegin(); else radioBegin();
   xTaskCreate(radioTask, "radio", 4096, nullptr, 5, nullptr);
   delay(500);
 
@@ -675,6 +748,7 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+  if (simMode) simTick(now);
   BtnEvent btn = pollButton();
   txBatteryTick(now);
 
@@ -733,6 +807,7 @@ void loop() {
       if (h) menuAdjust(menuSel, h);
       if (btn == BTN_SHORT) {
         if (menuSel == MI_CALIB) { ui = UI_CALIB; calStep = 0; for (int i = 0; i < 4; i++) { calMin[i] = 4095; calMax[i] = 0; } }
+        else if (menuSel == MI_SIM) { saveSettings(); restartSim(!simMode); }
         else if (menuSel == MI_SAVE) { saveSettings(); showMsg("SAVED"); exitMenu(); }
         else if (menuSel == MI_EXIT) { loadSettings(); exitMenu(); }
         else menuAdjust(menuSel, 1);

@@ -22,7 +22,7 @@
  *   ALT HOLD engages only on a CHANGE to ALT (a MODE press; arming with ALT already selected counts as a change):
  *     in the air  -> holds the current height
  *     on the ground -> motors idle until the throttle goes above the hover point, then it climbs
- *   Throttle in ALT HOLD: within +-deadband of the learned HOVER POINT = hold, above = climb (max 1 m/s),
+ *   Throttle in ALT HOLD: from HOVER POINT to mid stick (setting Stick mid), +-deadband = hold, above = climb (max 1 m/s),
  *   below = descend (max 0.7 m/s). Stick fully down on the ground for 0.8 s = LANDED (motors idle).
  *   Hover throttle is learned while hovering (SELF and ALT HOLD) and saved at disarm.
  *
@@ -156,7 +156,7 @@ struct Params {
   float gRollP, gRollI, gRollD, gPitchP, gPitchI, gPitchD, gYawP, gYawI;
   float gyroLpf, dtermLpf, notchHz, notchQ, accLpfHz, lvDLpfHz;
   float rcSmoothHz, itermRelax, antiGrav;
-  float altP, velP, velI, maxClimb, maxDesc, deadband, minThr, hover, ceilingM;
+  float altP, velP, velI, maxClimb, maxDesc, deadband, minThr, hover, ceilingM, thrMid, estTau;
   float osdOn, osdCols, osdRows;
 };
 struct ParamDef { const char *name; const char *label; float Params::*m; float def, mn, mx, step; uint8_t dec, grp; };
@@ -208,6 +208,7 @@ struct __attribute__((packed)) RecSample {   // flight recorder, 50 Hz
   uint16_t m[4];                   // us
   uint16_t vbat100, ctrlUs;
   int16_t  alt100, altT100;        // estimate / hold target, cm
+  int16_t  accUp100, accCorr100, altI10;   // vertical acceleration and its offset (cm/s^2), VEL I correction (us x10)
   int16_t  vel100;                 // vertical speed, cm/s
   uint8_t  flags;                  // bit0 mode ALT, bit1 alt valid, bit2 landed, bit3 failsafe landing
   uint8_t  vib10;
@@ -261,6 +262,8 @@ const ParamDef PARAMS[] = {
   {"minThr",       "Min throttle",  &Params::minThr,       1100,  1050, 1500, 10,    0, G_ALT},    // lowest in the air
   {"hover",        "Hover thr",     &Params::hover,        1250,  1100, 1800, 5,     0, G_ALT},    // learned (ref 3.85 V/cell)
   {"ceilingM",     "Ceiling m",     &Params::ceilingM,     0,     0, 100,     0.5f,  1, G_ALT},    // above the arming point, 0 = off
+  {"thrMid",       "Stick mid 0=hvr", &Params::thrMid,     1350,  0, 1800,    10,    0, G_ALT},    // what the TX sends at mid stick (SimpleTX Thr centre), also holds
+  {"estTau",       "Est blend s",   &Params::estTau,       BARO_TAU, 0.5f, 5, 0.1f,  1, G_ALT},    // shorter trusts the baro more for vertical speed
   {"rollTrim",     "Roll trim",     &Params::rollTrim,     0.4f,   -TRIM_LIMIT, TRIM_LIMIT, 0.1f, 1, G_TRIM},  // deg
   {"pitchTrim",    "Pitch trim",    &Params::pitchTrim,    -3.56f,   -TRIM_LIMIT, TRIM_LIMIT, 0.1f, 1, G_TRIM},
   {"rollSensRev",  "Roll sens rev", &Params::rollSensRev,  0,     0, 1,       1,     0, G_TRIM},   // 1 = reversed
@@ -268,7 +271,7 @@ const ParamDef PARAMS[] = {
   {"propsIn",      "Props in",      &Params::propsIn,      1,     0, 1,       1,     0, G_TRIM},   // 1 = props in (M1 CW)
   {"motorIdle",    "Motor idle us", &Params::motorIdle,    1100,  1000, 1300, 5,     0, G_TRIM},
   {"vRatio",       "Volt ratio",    &Params::vRatio,       10.65f, 1, 40,      0.05f, 2, G_BATT},   // (R1+R2)/R2
-  {"cells",        "Cells (0=auto)", &Params::cells,       3,     0, 8,       1,     0, G_BATT},
+  {"cells",        "Cells (0=auto)", &Params::cells,       4,     0, 8,       1,     0, G_BATT},
   {"cellWarn",     "Warn V/cell",   &Params::cellWarn,     3.5f,  3.0f, 4.0f, 0.05f, 2, G_BATT},
   {"osdOn",        "OSD on",        &Params::osdOn,        1,     0, 1,       1,     0, G_OSD},    // MSP DisplayPort to DJI O4
   {"osdCols",      "Canvas cols",   &Params::osdCols,      53,    30, 60,     1,     0, G_OSD},    // set by the air unit if it says
@@ -412,6 +415,7 @@ float baroPa = 0, baroGroundPa = 0, baroAlt = 0; bool baroNew = false;
 float altEst = 0, velEst = 0, accCorr = 0, accUp = 0; bool altValid = false;
 bool altHold = false, altLanded = false;
 uint32_t altLandSince = 0, altStuckSince = 0;
+float altZoneLo = 1350, altZoneHi = 1550;   // throttle stick inside this = hold height
 float altTarget = 0, altInteg = 0, altRefThr = 1450, altHoverBase = 1450, altThrRef = 1450, altThrOut = 1000;
 uint32_t exitBlendStart = 0; float exitBlendFrom = 1000;
 
@@ -693,7 +697,7 @@ void altEstTick(float dt) {
   // disarmed and still: the vertical speed is 0 -> learn the accelerometer bias, pin the estimate to the baro
   bool still = !armed && imuStill();
   if (still) { accCorr += (-accUp - accCorr) * dt; velEst = 0; altEst = baroAlt; return; }
-  const float k1 = 3 / BARO_TAU, k2 = 3 / (BARO_TAU * BARO_TAU), k3 = 1 / (BARO_TAU * BARO_TAU * BARO_TAU);
+  const float tau = P.estTau, k1 = 3 / tau, k2 = 3 / (tau * tau), k3 = 1 / (tau * tau * tau);
   float err = baroAlt - altEst;
   accCorr = constrain(accCorr + err * k3 * dt, -3.0f, 3.0f);
   velEst = constrain(velEst + (accUp + accCorr) * dt + err * k2 * dt, -10.0f, 10.0f);
@@ -713,6 +717,17 @@ void altHoldStart(bool ground) {
   altTarget = altEst;
   altRefThr = hoverPoint();                          // hold zone = around the hover throttle
   altHoverBase = constrain(P.hover, 1150.0f, 1750.0f);   // feed-forward (reference)
+  // Switched on in the air while (nearly) steady: the throttle the pilot is holding right now IS the hover throttle.
+  // Use it for the hold zone and the feed-forward, so no stick change is needed and a stale learned hover value
+  // cannot make it sink first and then overshoot (seen: rising past the target, then dropping almost to the ground).
+  if (!ground && fabsf(velEst) < 0.5f && ch[RX_THR] > P.minThr) {
+    altRefThr = ch[RX_THR];
+    altHoverBase = constrain(thrToRef(ch[RX_THR]), 1150.0f, 1750.0f);
+  }
+  // hold zone = from the lower to the higher of the hover point and mid stick, +- deadband
+  float mid = P.thrMid >= 1100 ? P.thrMid : altRefThr;
+  altZoneLo = min(altRefThr, mid) - P.deadband;
+  altZoneHi = max(altRefThr, mid) + P.deadband;
   altInteg = 0;
   altThrOut = ground ? 1000 : ch[RX_THR];
   setMsg(ground ? "ALT: STICK UP=TAKEOFF" : "ALT HOLD ON");
@@ -733,7 +748,7 @@ float altHoldThrottle(float dt) {
   uint32_t ms = millis();
   float thr = ch[RX_THR];
   if (altLanded) {
-    if (thr > altRefThr + P.deadband) {             // take off
+    if (thr > altZoneHi) {                          // take off
       altLanded = false; altTarget = altEst; altInteg = 0; altLandSince = altStuckSince = 0;
       setMsg("TAKEOFF");
     } else { altThrOut = 1000; return 1000; }       // idle, no stabilisation
@@ -758,9 +773,9 @@ float altHoldThrottle(float dt) {
       return 1000;
     }
   }
-  float d = thr - altRefThr, db = P.deadband, climb = 0;
-  if (d > db)       climb =  constrain((d - db) / 300.0f, 0.0f, 1.0f) * P.maxClimb;
-  else if (d < -db) climb = -constrain((-d - db) / 300.0f, 0.0f, 1.0f) * P.maxDesc;
+  float climb = 0;
+  if (thr > altZoneHi)      climb =  constrain((thr - altZoneHi) / 300.0f, 0.0f, 1.0f) * P.maxClimb;
+  else if (thr < altZoneLo) climb = -constrain((altZoneLo - thr) / 300.0f, 0.0f, 1.0f) * P.maxDesc;
   // the stick moves the TARGET at the commanded rate (kept within 0.5 m of the estimate)
   if (climb != 0) altTarget = constrain(altTarget + climb * dt, altEst - 0.5f, altEst + 0.5f);
   float velTgt = constrain(climb + P.altP * (altTarget - altEst), -P.maxDesc, P.maxClimb);
@@ -795,8 +810,16 @@ void hoverLearn(float dt) {
   if (!armed || !altValid || fabsf(roll) > 10 || fabsf(pitch) > 10) return;
   if (!altHold && inFlight && liftedOff && fabsf(velEst) < 0.3f && ch[RX_THR] > 1150)
     P.hover += (thrToRef(ch[RX_THR]) - P.hover) * dt / 4;
-  if (altHold && !altLanded && fabsf(ch[RX_THR] - altRefThr) <= P.deadband && fabsf(velEst) < 0.15f && altThrOut > 1150)
-    P.hover += (altThrRef - P.hover) * dt / 8;
+  // in ALT HOLD: whenever it is steady at its target (whatever the stick does), the throttle it needs is the hover
+  // throttle. The feed-forward follows it and the integrator gives up the same amount (no bump), so the next hold
+  // starts with the right value instead of winding the integrator up again.
+  if (altHold && !altLanded && fabsf(velEst) < 0.15f && fabsf(altTarget - altEst) < 0.25f && altThrOut > P.minThr + 20) {
+    float d = (altThrRef - P.hover) * dt / 6;
+    P.hover += d;
+    float nb = constrain(P.hover, 1150.0f, 1750.0f);
+    altInteg = constrain(altInteg - (nb - altHoverBase), -250.0f, 250.0f);
+    altHoverBase = nb;
+  }
   P.hover = constrain(P.hover, 1100.0f, 1800.0f);
 }
 
@@ -1016,9 +1039,9 @@ void updateMode() {
   if (!armed) altHold = false;
   else if (altHold && !want) altHoldStop("SELF-LEVEL");
   else if (altHold && !altValid) altHoldStop("ALT LOST-MANUAL");
-  else if (!altHold && flipIn) {
-    if (!altValid) { setMsg("NO BARO"); BEEP_THREE; }
-    else altHoldStart(!inFlight || ch[RX_THR] < 1150);
+  else if (!altHold && want) {                          // level-checked: arming zeroes the baro, so altValid can be
+    if (altValid) altHoldStart(!inFlight || ch[RX_THR] < 1150);   // false for a moment and a one-shot try never came back
+    else if (flipIn) { setMsg("NO BARO"); BEEP_THREE; }
   }
   mode = altHold ? MODE_ALT : MODE_SELF;
 }
@@ -1044,7 +1067,7 @@ void levelCalTick() {
   uint32_t ms = millis();
   if (!levelCalRunning) {
     if (!levelCalRequest) {
-      bool cmd = !armed && rcValid && page != PG_SETUP && ch[RX_THR] < 1100 && ch[RX_YAW] < 1150 && ch[RX_PITCH] < 1150 &&
+      bool cmd = !armed && rcValid && page != PG_SETUP && ch[RX_THR] < 1100 && ch[RX_YAW] < 1300 && ch[RX_PITCH] < 1300 &&
                  fabsf(stick(ch[RX_ROLL])) < 0.3f;
       if (!cmd) { holdSince = 0; return; }
       if (!holdSince) holdSince = ms ? ms : 1;
@@ -1076,7 +1099,7 @@ void trimStickTick() {
   static uint32_t next = 0;
   static bool changed = false;
   uint32_t now = millis();
-  bool cond = !armed && rcValid && page != PG_SETUP && ch[RX_THR] > 1800 && fabsf(stick(ch[RX_YAW])) < 0.3f;
+  bool cond = !armed && rcValid && page != PG_SETUP && ch[RX_THR] > 1600 && fabsf(stick(ch[RX_YAW])) < 0.3f;
   float sr = stick(ch[RX_ROLL]), sp = stick(ch[RX_PITCH]);   // + = right / forward
   int dr = 0, dp = 0;
   if (cond) { dr = sr > 0.5f ? 1 : (sr < -0.5f ? -1 : 0); dp = sp > 0.5f ? 1 : (sp < -0.5f ? -1 : 0); }
@@ -1368,6 +1391,7 @@ void recTick(uint32_t ms) {
   s.flags = (mode == MODE_ALT ? 1 : 0) | (altValid ? 2 : 0) | (altLanded ? 4 : 0) | (fsLanding ? 8 : 0);
   s.vib10 = (uint8_t)constrain(vibration() * 10, 0.0f, 255.0f);
   s.rssi = (int8_t)lroundf(rcRssiF); s.lq = rcLq;
+  s.accUp100 = c16(accUp * 100); s.accCorr100 = c16(accCorr * 100); s.altI10 = c16(altInteg * 10);
   recHead = (recHead + 1) % REC_N;
   if (recCount < REC_N) recCount++;
 }
@@ -1387,15 +1411,16 @@ void recDump() {
     if (f) f.close();
   }
   Serial.printf("REC BEGIN %u samples, %u ms, from %s\n", recCount, REC_MS, fromFlash ? "flash" : "RAM");
-  Serial.println("t,roll,pitch,rollT,pitchT,gR,gP,gY,thr,rcR,rcP,rcY,m1,m2,m3,m4,vbat,ctrl_us,alt,altT,vel,mode,altValid,landed,fsLand,vib,rssi,lq");
+  Serial.println("t,roll,pitch,rollT,pitchT,gR,gP,gY,thr,rcR,rcP,rcY,m1,m2,m3,m4,vbat,ctrl_us,alt,altT,vel,mode,altValid,landed,fsLand,vib,rssi,lq,accUp,accCorr,altI");
   uint16_t start = recCount < REC_N ? 0 : recHead;
   for (uint16_t k = 0; k < recCount; k++) {
     const RecSample &s = recBuf[(start + k) % REC_N];
-    Serial.printf("%.2f,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.2f,%u,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.1f,%d,%u\n",
+    Serial.printf("%.2f,%.1f,%.1f,%.1f,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.2f,%u,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.1f,%d,%u,%.2f,%.2f,%.1f\n",
                   s.t10 / 100.0f, s.roll10 / 10.0f, s.pitch10 / 10.0f, s.rollT10 / 10.0f, s.pitchT10 / 10.0f,
                   s.gR, s.gP, s.gY, s.thr, s.rcR, s.rcP, s.rcY, s.m[0], s.m[1], s.m[2], s.m[3],
                   s.vbat100 / 100.0f, s.ctrlUs, s.alt100 / 100.0f, s.altT100 / 100.0f, s.vel100 / 100.0f,
-                  s.flags & 1, (s.flags >> 1) & 1, (s.flags >> 2) & 1, (s.flags >> 3) & 1, s.vib10 / 10.0f, s.rssi, s.lq);
+                  s.flags & 1, (s.flags >> 1) & 1, (s.flags >> 2) & 1, (s.flags >> 3) & 1, s.vib10 / 10.0f, s.rssi, s.lq,
+                  s.accUp100 / 100.0f, s.accCorr100 / 100.0f, s.altI10 / 10.0f);
     if ((k & 31) == 31) delay(2);
   }
   Serial.println("REC END");
@@ -1464,7 +1489,7 @@ int grpN = 0;
 struct StickKey {                  // stick as a key: -1/0/+1 events with auto-repeat (faster the longer it is held)
   int last = 0; uint32_t next = 0, since = 0;
   int poll(float v) {
-    int d = v > 0.6f ? 1 : (v < -0.6f ? -1 : 0), ev = 0;
+    int d = v > 0.4f ? 1 : (v < -0.4f ? -1 : 0), ev = 0;   // 0.4: yaw only reaches ~0.57
     uint32_t now = millis();
     if (d && d != last) { ev = d; next = now + 400; since = now; }
     else if (d && (int32_t)(now - next) >= 0) { ev = d; next = now + (now - since > 2000 ? 60 : 150); }
@@ -1511,7 +1536,7 @@ void menuTick() {
   static uint32_t openHold = 0;
   uint32_t ms = millis();
   if (page != PG_SETUP) {
-    bool cmd = !armed && rcValid && ch[RX_THR] < 1100 && ch[RX_YAW] < 1150 && ch[RX_PITCH] > 1850;
+    bool cmd = !armed && rcValid && ch[RX_THR] < 1100 && ch[RX_YAW] < 1300 && ch[RX_PITCH] > 1700;
     if (!cmd) openHold = 0;
     else if (!openHold) openHold = ms ? ms : 1;
     else if (ms - openHold > 1000) { openHold = 0; enterSetup(); BEEP_SHORT; }
@@ -1534,7 +1559,7 @@ void menuTick() {
   if (menuGrp == MENU_MOTORS) {                  // motor test: pitch = pick, hold roll RIGHT = spin, yaw left = back
     if (v > 0) mtSel = (mtSel + 4) % 5;
     if (v < 0) mtSel = (mtSel + 1) % 5;
-    mtSpin = sR > 0.6f && ch[RX_ARM] < 1700;
+    mtSpin = sR > 0.4f && ch[RX_ARM] < 1700;
     if (y < 0) { mtSpin = false; menuGrp = -1; menuSel = ACT_MOTORS; }
     return;
   }
@@ -1546,7 +1571,7 @@ void menuTick() {
     if (h) {
       const ParamDef &d = PARAMS[grpIdx[menuSel]];
       float &val = P.*(d.m);
-      float st = d.step * (ch[RX_THR] > 1700 ? 10 : 1);
+      float st = d.step * (ch[RX_THR] > 1600 ? 10 : 1);
       val = constrain(roundf((val + h * st) / d.step) * d.step, d.mn, d.mx);
       filtersSetup();
       dirty = true;

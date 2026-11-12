@@ -20,7 +20,7 @@ On first boot each sketch imports what it can from the old sketch's flash on the
    Otherwise fix it with Rev in the TX menu.
 3. Arm (button, throttle low). Raise the throttle a little and tilt the quad right by hand: the right motors (M1, M2)
    must speed up. Yaw right on the stick: M2 and M3 (CCW props) must speed up.
-4. Press the TX MODE button (GPIO20): the FC OLED/TX shows ALT. Armed on the ground it stays at idle until the throttle is above the hover point.
+4. Press the TX MODE button (GPIO20): the FC OLED/TX shows ALT. Armed on the ground it stays at idle until the throttle is above the hold zone (hover point to Stick mid, + Stick dband).
 5. Unplug the TX while armed with the throttle up a little: after 1 s the FC disarms (it is not flying, so no auto-land).
 
 ## Setup on the FC OLED (disarmed, no PC)

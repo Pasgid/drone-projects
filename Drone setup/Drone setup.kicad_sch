@@ -1,0 +1,12 @@
+(kicad_sch (version 20240702) (generator "protoflow_schematic_v2")
+  (uuid "1852b1f6-6dd5-447c-985b-06f0c4032356")
+  (paper "A4")
+  (title_block
+    (title "Drone setup")
+    (rev "1.0")
+    (company "Protoflow")
+  )
+  (sheet_instances
+    (path "/" (page "1"))
+  )
+)
