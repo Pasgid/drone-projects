@@ -2,6 +2,12 @@
 
 One page per board: a pinout picture, then the same pins as a table. The pin numbers are taken from each sketch's `#define PIN_...` and motor-pin arrays. If a pin changes in a sketch, change it in [docs/make_pinouts.py](docs/make_pinouts.py) and run `python docs/make_pinouts.py` to redraw the pictures.
 
+## Quick setup guide (SimpleFC_Brushed)
+
+![SimpleFC_Brushed setup guide](docs/img/setup_guide_brushed.gif)
+
+Made by [docs/make_setup_gif.py](docs/make_setup_gif.py) (needs `pip install pillow` and Edge or Chrome).
+
 | Board | Sketch | Chip |
 |---|---|---|
 | [SimpleFC (brushless quad)](#simplefc--brushless-quad) | [SimpleFC/SimpleFC.ino](SimpleFC/SimpleFC.ino) | ESP32-C3 SuperMini |
