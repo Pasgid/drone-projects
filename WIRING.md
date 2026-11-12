@@ -9,8 +9,15 @@ One page per board: a pinout picture, then the same pins as a table. The pin num
 - Transmitter2: [setup_guide_transmitter2.gif](docs/img/setup_guide_transmitter2.gif)
 - C3 Zero FC (FlightController): [setup_guide_c3zero_fc.gif](docs/img/setup_guide_c3zero_fc.gif)
 
-Videos (vertical 1080x1920 MP4 for TikTok / Reels / Shorts, with the repo link at the bottom). Open one and press the download button:
-[SimpleFC_Brushed](docs/video/setup_brushed.mp4) · [SimpleTX + SimpleFC](docs/video/setup_simpletx_simplefc.mp4) · [Transmitter2](docs/video/setup_transmitter2.mp4) · [C3 Zero FC](docs/video/setup_c3zero_fc.mp4)
+Videos (open one on GitHub and press the download button):
+
+| Guide | TikTok / Reels / YouTube Shorts (1080x1920) | YouTube (1920x1080) |
+|---|---|---|
+| SimpleFC_Brushed | [setup_brushed.mp4](docs/video/setup_brushed.mp4) | [setup_brushed_1080p.mp4](docs/video/setup_brushed_1080p.mp4) |
+| SimpleTX + SimpleFC | [setup_simpletx_simplefc.mp4](docs/video/setup_simpletx_simplefc.mp4) | [setup_simpletx_simplefc_1080p.mp4](docs/video/setup_simpletx_simplefc_1080p.mp4) |
+| Transmitter2 | [setup_transmitter2.mp4](docs/video/setup_transmitter2.mp4) | [setup_transmitter2_1080p.mp4](docs/video/setup_transmitter2_1080p.mp4) |
+| C3 Zero FC | [setup_c3zero_fc.mp4](docs/video/setup_c3zero_fc.mp4) | [setup_c3zero_fc_1080p.mp4](docs/video/setup_c3zero_fc_1080p.mp4) |
+| All four, with chapters | | [setup_all_guides_1080p.mp4](docs/video/setup_all_guides_1080p.mp4) + [description with chapters](docs/video/youtube_description.txt) |
 
 ### SimpleFC_Brushed
 

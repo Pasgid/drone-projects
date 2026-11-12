@@ -223,7 +223,7 @@ def build(key):
     out = os.path.join(IMG, out_name)
     pal[0].save(out, save_all=True, append_images=pal[1:], duration=durations, loop=0, optimize=True)
     print("wrote %s  %.0f kB  %d frames  (pngs in %s)" % (out, os.path.getsize(out) / 1024, len(frames), tmp))
-    video(key, steps, frames, durations, tmp)
+    return steps, frames, durations, tmp
 
 def font(size, bold=True):
     for n in (("segoeuib.ttf" if bold else "segoeui.ttf"), "arialbd.ttf", "arial.ttf"):
@@ -231,35 +231,87 @@ def font(size, bold=True):
         except OSError: pass
     return ImageFont.load_default()
 
-def centre(d, y, s, f, fill):
-    w = d.textlength(s, font=f); d.text(((VW - w) / 2, y), s, font=f, fill=fill)
+def centre(d, y, s, f, fill, cx=None):
+    w = d.textlength(s, font=f); d.text(((cx if cx is not None else VW / 2) - w / 2, y), s, font=f, fill=fill)
 
-def video(key, steps, frames, durations, tmp):
-    """Vertical MP4: the guide's title on top, the step card in the middle, the link at the bottom."""
+def encode(items, out):
+    """items: [(png path, milliseconds)] -> H.264 MP4 with a silent audio track (TikTok / YouTube accept it)."""
     import imageio_ffmpeg
-    os.makedirs(VID, exist_ok=True)
-    title = steps[0][0].replace(" setup", "")
-    lst = os.path.join(tmp, "list.txt")
+    lst = out + ".txt"
     with open(lst, "w", encoding="utf-8") as L:
-        for i, (fr, ms) in enumerate(zip(frames, durations)):
-            v = Image.new("RGB", (VW, VH), "#0f1720"); d = ImageDraw.Draw(v)
-            centre(d, 170, "ESP32 DIY DRONE", font(44), "#e0620d")
-            centre(d, 235, title, font(58), "#ffffff")
-            centre(d, 320, "setup guide  -  step %d of %d" % (i + 1, len(frames)), font(36, False), "#9fb3c8")
-            card = fr.resize((VW, round(H * VW / W)), Image.LANCZOS)
-            v.paste(card, (0, (VH - card.height) // 2 + 20))
-            d.rounded_rectangle((90, 1560, VW - 90, 1680), 30, fill="#1d2b3a")
-            centre(d, 1576, "Wiring + code:", font(32, False), "#9fb3c8")
-            centre(d, 1614, LINK, font(42), "#7ee787")
-            p = os.path.join(tmp, "v%02d.png" % i); v.save(p)
+        for p, ms in items:
             L.write("file '%s'\nduration %.3f\n" % (p.replace("\\", "/"), ms / 1000))
-        L.write("file '%s'\n" % p.replace("\\", "/"))       # concat needs the last frame twice
-    out = os.path.join(VID, os.path.splitext(GUIDES[key][0])[0].replace("setup_guide_", "setup_") + ".mp4")
+        L.write("file '%s'\n" % items[-1][0].replace("\\", "/"))       # concat needs the last frame twice
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst,
-                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
-                    "-vf", "fps=%d,format=yuv420p" % FPS, "-c:v", "libx264", "-preset", "slow", "-crf", "20",
-                    "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", out], check=True)
-    print("wrote %s  %.1f MB  %.0f s" % (out, os.path.getsize(out) / 1e6, sum(durations) / 1000))
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-shortest",
+                    "-vf", "fps=%d,format=yuv420p" % FPS, "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out], check=True)
+    os.remove(lst)
+    print("wrote %s  %.1f MB  %.0f s" % (out, os.path.getsize(out) / 1e6, sum(ms for _, ms in items) / 1000))
 
+def vertical(key, steps, frames, durations, tmp):
+    """1080x1920: TikTok, Reels, YouTube Shorts. Title on top, step card in the middle, link at the bottom."""
+    title = steps[0][0].replace(" setup", "")
+    items = []
+    for i, (fr, ms) in enumerate(zip(frames, durations)):
+        v = Image.new("RGB", (VW, VH), "#0f1720"); d = ImageDraw.Draw(v)
+        centre(d, 170, "ESP32 DIY DRONE", font(44), "#e0620d")
+        centre(d, 235, title, font(58), "#ffffff")
+        centre(d, 320, "setup guide  -  step %d of %d" % (i + 1, len(frames)), font(36, False), "#9fb3c8")
+        card = fr.resize((VW, round(H * VW / W)), Image.LANCZOS)
+        v.paste(card, (0, (VH - card.height) // 2 + 20))
+        d.rounded_rectangle((90, 1560, VW - 90, 1680), 30, fill="#1d2b3a")
+        centre(d, 1576, "Wiring + code:", font(32, False), "#9fb3c8")
+        centre(d, 1614, LINK, font(42), "#7ee787")
+        p = os.path.join(tmp, "v%02d.png" % i); v.save(p); items.append((p, ms))
+    encode(items, os.path.join(VID, os.path.splitext(GUIDES[key][0])[0].replace("setup_guide_", "setup_") + ".mp4"))
+
+LW, LH = 1920, 1080
+def landscape_frames(steps, frames, durations, tmp, tag):
+    """1920x1080 frames for YouTube: a title bar, the card big in the middle, the link at the bottom."""
+    title = steps[0][0].replace(" setup", "")
+    items = []
+    ch = 880; cw = round(W * ch / H)
+    for i, (fr, ms) in enumerate(zip(frames, durations)):
+        v = Image.new("RGB", (LW, LH), "#0f1720"); d = ImageDraw.Draw(v)
+        d.text((40, 30), "ESP32 DIY DRONE", font=font(34), fill="#e0620d")
+        d.text((40, 72), title, font=font(30, False), fill="#ffffff")
+        rt = "step %d / %d" % (i + 1, len(frames)); d.text((LW - 40 - d.textlength(rt, font=font(30, False)), 52), rt, font=font(30, False), fill="#9fb3c8")
+        v.paste(fr.resize((cw, ch), Image.LANCZOS), ((LW - cw) // 2, 120))
+        centre(d, 1018, "Wiring + code:  " + LINK, font(34), "#7ee787", LW / 2)
+        p = os.path.join(tmp, "%s%02d.png" % (tag, i)); v.save(p); items.append((p, ms))
+    return items
+
+def title_card(tmp, name, text, sub):
+    v = Image.new("RGB", (LW, LH), "#0f1720"); d = ImageDraw.Draw(v)
+    centre(d, 380, "ESP32 DIY DRONE", font(60), "#e0620d", LW / 2)
+    centre(d, 470, text, font(96), "#ffffff", LW / 2)
+    centre(d, 610, sub, font(44, False), "#9fb3c8", LW / 2)
+    centre(d, 900, LINK, font(44), "#7ee787", LW / 2)
+    p = os.path.join(tmp, name + ".png"); v.save(p); return p
+
+def fmt(ms): s = int(ms // 1000); return "%d:%02d" % (s // 60, s % 60)
+
+built = {}
 for k in (sys.argv[1:] or GUIDES):
-    build(k)
+    steps, frames, durations, tmp = build(k)
+    vertical(k, steps, frames, durations, tmp)
+    items = landscape_frames(steps, frames, durations, tmp, "l")
+    encode(items, os.path.join(VID, os.path.splitext(GUIDES[k][0])[0].replace("setup_guide_", "setup_") + "_1080p.mp4"))
+    built[k] = (steps, items, tmp)
+
+if set(built) == set(GUIDES):     # all guides: one long YouTube video with chapters
+    tmp = list(built.values())[0][2]
+    items = [(title_card(tmp, "intro", "Setup guides", "SimpleFC Brushed  -  SimpleTX + SimpleFC  -  Transmitter2  -  C3 Zero FC"), 4000)]
+    chapters = ["0:00 Intro"]
+    for k, (steps, its, _) in built.items():
+        name = steps[0][0].replace(" setup", "")
+        chapters.append("%s %s" % (fmt(sum(ms for _, ms in items)), name))
+        items.append((title_card(tmp, "t_" + k, name, "%d steps" % len(its)), 2500))
+        items += its
+    out = os.path.join(VID, "setup_all_guides_1080p.mp4")
+    encode(items, out)
+    open(os.path.join(VID, "youtube_description.txt"), "w", encoding="utf-8").write(
+        "ESP32-C3 DIY drone: setup guides for the flight controllers and transmitters.\n\n"
+        "Wiring, pin numbers and code: https://%s\n\nChapters:\n%s\n" % (LINK, "\n".join(chapters)))
+    print("chapters:", chapters)

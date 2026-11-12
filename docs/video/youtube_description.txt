@@ -1,0 +1,10 @@
+ESP32-C3 DIY drone: setup guides for the flight controllers and transmitters.
+
+Wiring, pin numbers and code: https://github.com/Pasgid/drone-projects
+
+Chapters:
+0:00 Intro
+0:04 SimpleFC_Brushed
+0:46 SimpleTX + SimpleFC
+1:33 Transmitter2
+2:05 C3 Zero FC (FlightController)
