@@ -2,7 +2,14 @@
 
 One page per board: a pinout picture, then the same pins as a table. The pin numbers are taken from each sketch's `#define PIN_...` and motor-pin arrays. If a pin changes in a sketch, change it in [docs/make_pinouts.py](docs/make_pinouts.py) and run `python docs/make_pinouts.py` to redraw the pictures.
 
-## Quick setup guide (SimpleFC_Brushed)
+## Setup guides
+
+- SimpleFC_Brushed: below
+- SimpleTX + SimpleFC: [setup_guide_simpletx_simplefc.gif](docs/img/setup_guide_simpletx_simplefc.gif)
+- Transmitter2: [setup_guide_transmitter2.gif](docs/img/setup_guide_transmitter2.gif)
+- C3 Zero FC (FlightController): [setup_guide_c3zero_fc.gif](docs/img/setup_guide_c3zero_fc.gif)
+
+### SimpleFC_Brushed
 
 ![SimpleFC_Brushed setup guide](docs/img/setup_guide_brushed.gif)
 
@@ -34,6 +41,10 @@ Betaflight order, seen from the top, front up, props in.
 ---
 
 ## SimpleFC – brushless quad
+
+**Setup guide:**
+
+![SimpleTX + SimpleFC setup guide](docs/img/setup_guide_simpletx_simplefc.gif)
 
 ![SimpleFC pinout](docs/img/simplefc_pinout.svg)
 
@@ -95,6 +106,10 @@ Shield PCB files are in [SimpleFC_Brushed/pcb](SimpleFC_Brushed/pcb). Parts plac
 
 ## SimpleTX – transmitter
 
+**Setup guide:**
+
+![SimpleTX + SimpleFC setup guide](docs/img/setup_guide_simpletx_simplefc.gif)
+
 ![SimpleTX pinout](docs/img/simpletx_pinout.svg)
 
 | Pin | Connects to |
@@ -115,6 +130,10 @@ Each pot has one end on 3V3, the other on GND, and the wiper on its pin. The but
 
 ## Transmitter2
 
+**Setup guide:**
+
+![Transmitter2 setup guide](docs/img/setup_guide_transmitter2.gif)
+
 ![Transmitter2 pinout](docs/img/transmitter2_pinout.svg)
 
 | Pin | Connects to |
@@ -122,8 +141,8 @@ Each pot has one end on 3V3, the other on GND, and the wiper on its pin. The but
 | G1 / G3 / G4 / G0 | Throttle / Roll / Pitch / Yaw pot wipers |
 | G5 / G6 | OLED SDA / SCL (SH1106, 0x3C) |
 | G7 | ARM button to GND |
-| G20 | 3-position switch, POS1 leg (DISARM) |
-| G8 | 3-position switch, POS3 leg (ARM + extra) |
+| G20 | 3-position switch, POS1 leg (SELF-LEVEL) |
+| G8 | 3-position switch, POS3 leg (POS HOLD) |
 | G21 | Passive buzzer: 1k → NPN base |
 | G2 | TX battery divider |
 
@@ -132,6 +151,10 @@ The 3-position switch has its middle leg on GND and needs no resistors. Don't us
 ---
 
 ## FlightController – old C3 Zero quad
+
+**Setup guide:**
+
+![C3 Zero FC setup guide](docs/img/setup_guide_c3zero_fc.gif)
 
 ![FlightController pinout](docs/img/flightcontroller_pinout.svg)
 

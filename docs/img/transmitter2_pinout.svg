@@ -67,12 +67,12 @@
 <text x="655.0" y="198.0" font-size="12" fill="#fff" text-anchor="end" font-weight="bold">G20</text>
 <line x1="669.0" y1="194" x2="731.0" y2="194" stroke="#6b7280" stroke-width="4"/>
 <rect x="739.0" y="182" width="330" height="24" rx="5" fill="#6b7280" opacity="1"/>
-<text x="747.0" y="199.0" font-size="13" fill="#fff" text-anchor="start" font-weight="bold">3-pos switch POS1 leg (DISARM)</text>
+<text x="747.0" y="199.0" font-size="13" fill="#fff" text-anchor="start" font-weight="bold">3-pos switch POS1 leg (SELF)</text>
 <circle cx="669.0" cy="228" r="7" fill="#6b7280" stroke="#d9b24a" stroke-width="2.5"/>
 <text x="655.0" y="232.0" font-size="12" fill="#fff" text-anchor="end" font-weight="bold">G8</text>
 <line x1="669.0" y1="228" x2="731.0" y2="228" stroke="#6b7280" stroke-width="4"/>
 <rect x="739.0" y="216" width="330" height="24" rx="5" fill="#6b7280" opacity="1"/>
-<text x="747.0" y="233.0" font-size="13" fill="#fff" text-anchor="start" font-weight="bold">3-pos switch POS3 leg (ARM + extra)</text>
+<text x="747.0" y="233.0" font-size="13" fill="#fff" text-anchor="start" font-weight="bold">3-pos switch POS3 leg (POS HOLD)</text>
 <circle cx="669.0" cy="262" r="7" fill="#8b3fd1" stroke="#d9b24a" stroke-width="2.5"/>
 <text x="655.0" y="266.0" font-size="12" fill="#fff" text-anchor="end" font-weight="bold">G21</text>
 <line x1="669.0" y1="262" x2="731.0" y2="262" stroke="#8b3fd1" stroke-width="4"/>
